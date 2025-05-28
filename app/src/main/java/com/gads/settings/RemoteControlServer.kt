@@ -112,25 +112,29 @@ class RemoteControlServer(private val port: Int) {
 
 
                 post("/clipboard") {
-                    // 1. remember current IME
-                    val curIme = exec(("settings get secure default_input_method").trim())
+                    try {
+                        // 1. remember current IME
+                        val curIme = exec(("settings get secure default_input_method").trim())
 
-                    // 2. switch to RemoteIme (enable if necessary)
-                           exec("ime enable com.gads.settings/.GADSKeyboardIME")
-                            exec("ime set com.gads.settings/.GADSKeyboardIME")
+                        // 2. switch to RemoteIme (enable if necessary)
+                        exec("ime enable com.gads.settings/.GADSKeyboardIME")
+                        exec("ime set com.gads.settings/.GADSKeyboardIME")
 
-                    // 3. synchronous ordered broadcast: resultData holds Base64 text
-                    val res = exec(
-                        "am broadcast -n com.gads.settings/.ClipboardReceiver -a com.gads.settings.CLIPBOARD_GET"
-                    )
-                    val b64 = Regex("""Broadcast completed: result=.*?data="(.*?)"""")
-                        .find(res)?.groupValues?.get(1) ?: ""
-                    val text = String(Base64.decode(b64, Base64.NO_WRAP))
+                        // 3. synchronous ordered broadcast: resultData holds Base64 text
+                        val res = exec(
+                            "am broadcast -n com.gads.settings/.ClipboardReceiver -a com.gads.settings.CLIPBOARD_GET"
+                        )
+                        val b64 = Regex("""Broadcast completed: result=.*?data="(.*?)"""")
+                            .find(res)?.groupValues?.get(1) ?: ""
+                        val text = String(Base64.decode(b64, Base64.NO_WRAP))
 
-                    // 4. restore user IME
-                    exec("ime set $curIme")
+                        // 4. restore user IME
+                        exec("ime set $curIme")
 
-                    call.respond(HttpStatusCode.OK, "{\"status\": \"${text}\"}")
+                        call.respond(HttpStatusCode.OK, "{\"value\": \"${b64}\"}")
+                    } catch (e: Exception) {
+                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                    }
                 }
 
                 post("/home") {
@@ -139,6 +143,26 @@ class RemoteControlServer(private val port: Int) {
                         call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
                     } catch (e: Exception) {
                         println("Home error: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                    }
+                }
+
+                post("/lock") {
+                    try {
+                        inputInjector.pressPower()
+                        call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                    } catch (e: Exception) {
+                        println("Lock error: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                    }
+                }
+
+                post("/unlock") {
+                    try {
+                        inputInjector.pressPower()
+                        call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                    } catch (e: Exception) {
+                        println("Unlock error: ${e.message}")
                         call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
                     }
                 }
