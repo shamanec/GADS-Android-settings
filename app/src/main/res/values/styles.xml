@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Basic application theme -->
+    <style name="AppTheme" parent="android:Theme.DeviceDefault">
+        <!-- Any theme attributes can go here -->
+    </style>
+</resources>

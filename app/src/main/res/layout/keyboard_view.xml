@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:orientation="vertical"
+    android:background="#E0E0E0">
+
+    <!-- Status indicator -->
+    <TextView
+        android:id="@+id/remote_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#333333"
+        android:padding="4dp"
+        android:text="Remote: Active"
+        android:textColor="#4CAF50"
+        android:minWidth="200dp"
+        android:textSize="12sp"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- Keyboard View -->
+    <com.gads.settings.HighlightKeyboardView
+        android:id="@+id/keyboard_view"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#E0E0E0"
+        android:keyTextSize="22sp"
+        android:keyTextColor="#000000"
+        android:keyBackground="@drawable/key_background"
+        android:keyPreviewLayout="@null" />
+
+</LinearLayout>
