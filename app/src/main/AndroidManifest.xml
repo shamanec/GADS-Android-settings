@@ -12,7 +12,7 @@
     <application
         android:allowBackup="true"
         android:label="GADS Settings"
-        android:icon="@mipmap/ic_launcher_foreground"
+        android:icon="@mipmap/ic_launcher"
         android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true">
 
@@ -35,7 +35,7 @@
             android:name=".streaming.MjpegScreenCaptureActivity"
             android:configChanges="orientation|screenSize"
             android:exported="true"
-            android:label="GADS Stream"
+            android:label="GADS Settings"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:excludeFromRecents="true">
             <intent-filter>
@@ -47,7 +47,7 @@
             android:name=".webrtc.WebRTCScreenCaptureActivity"
             android:configChanges="orientation|screenSize"
             android:exported="true"
-            android:label="GADS Stream"
+            android:label="GADS Settings"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:excludeFromRecents="true">
             <intent-filter>
