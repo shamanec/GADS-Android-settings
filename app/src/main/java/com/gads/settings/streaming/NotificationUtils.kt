@@ -48,11 +48,11 @@ object NotificationUtils {
     // The method returns the created Notification object.
     private fun createNotification(context: Context): Notification {
         val builder = NotificationCompat.Builder(context, NOTIFICATION_CHANNEL_ID)
-        builder.setSmallIcon(R.drawable.ic_launcher_background)
+        builder.setSmallIcon(R.drawable.ic_gads_notification_logo)
         builder.setContentText("GADS-Settings is recording this device's screen..")
         builder.setOngoing(true)
         builder.setCategory(Notification.CATEGORY_SERVICE)
-        builder.setPriority(Notification.PRIORITY_LOW)
+        builder.setPriority(Notification.PRIORITY_HIGH)
         builder.setShowWhen(true)
         return builder.build()
     }
