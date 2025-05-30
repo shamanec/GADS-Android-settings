@@ -57,9 +57,15 @@ fun exec(
 
 class RemoteControlServer(private val port: Int) {
     private val inputInjector = InputInjector()
+    private var screenWidth: Int = 0
+    private var screenHeight: Int = 0
 
     @SuppressLint("NewApi")
     fun start() {
+        val screenDimensions = getScreenSize()
+        screenWidth = screenDimensions.first
+        screenHeight = screenDimensions.second
+
         embeddedServer(CIO, port = port) {
             routing {
                 post("/tap") {
@@ -107,6 +113,15 @@ class RemoteControlServer(private val port: Int) {
                         call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
                     } catch (e: Exception) {
                         println("Swipe error: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                    }
+                }
+
+                get("/screen-size") {
+                    try {
+                        call.respondText("{\"x\": ${screenWidth}, \"y\": ${screenHeight}}")
+                    } catch (e: Exception) {
+                        println("Get screen error: ${e.message}")
                         call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
                     }
                 }
@@ -183,6 +198,25 @@ class RemoteControlServer(private val port: Int) {
                 }
             }
         }.start(wait = true)
+    }
+
+    @SuppressLint("PrivateApi", "DiscouragedPrivateApi")
+    fun getScreenSize(): Pair<Int, Int> {
+        val dmgCls = Class.forName("android.hardware.display.DisplayManagerGlobal")
+        val getInst = dmgCls.getDeclaredMethod("getInstance")
+        val dmg = getInst.invoke(null)
+
+        val getDisplay = dmgCls.getDeclaredMethod("getRealDisplay", Int::class.javaPrimitiveType)
+        val display = getDisplay.invoke(dmg, 0)  // 0 = DEFAULT_DISPLAY
+
+        val dm = android.util.DisplayMetrics()
+        val getMetrics = display.javaClass.getDeclaredMethod("getRealMetrics", android.util.DisplayMetrics::class.java)
+        getMetrics.invoke(display, dm)
+
+        val width = dm.widthPixels
+        val height = dm.heightPixels
+        println("Screen size via DisplayManagerGlobal: ${width}x${height}")
+        return width to height
     }
 }
 
