@@ -19,6 +19,7 @@ import io.ktor.server.routing.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -296,24 +297,32 @@ class InputInjector {
         println("Tap at ($x, $y)")
     }
 
-    fun touchAndHold(x: Float, y: Float, duration: Long) {
+    fun touchAndHoldAsync(
+        x: Float, y: Float, duration: Long
+    ) {
+        scope.launch { touchAndHold(x, y, duration) }
+    }
+
+    suspend fun touchAndHold(x: Float, y: Float, duration: Long) {
         val time = SystemClock.uptimeMillis()
 
         val down = MotionEvent.obtain(time, time, MotionEvent.ACTION_DOWN, x, y, 0).apply {
             source = InputDevice.SOURCE_TOUCHSCREEN
         }
+        injectEvent(down)
 
-        val up = MotionEvent.obtain(time, time + duration, MotionEvent.ACTION_UP, x, y, 0).apply {
+        delay(duration)
+
+        val upTime = SystemClock.uptimeMillis()
+        val up = MotionEvent.obtain(upTime, upTime, MotionEvent.ACTION_UP, x, y, 0).apply {
             source = InputDevice.SOURCE_TOUCHSCREEN
         }
-
-        injectEvent(down)
         injectEvent(up)
 
         down.recycle()
         up.recycle()
 
-        println("Touch and hold at ($x, $y)")
+        println("Touch and hold at ($x, $y) for duration $duration")
     }
 
     fun swipeAsync(
