@@ -2,6 +2,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    id("org.jetbrains.kotlin.plugin.serialization") version "2.0.0"
 }
 
 android {
@@ -74,7 +75,7 @@ dependencies {
     implementation ("io.ktor:ktor-serialization-kotlinx-json:2.3.4")
 
     // Kotlinx Serialization
-    implementation ("org.jetbrains.kotlinx:kotlinx-serialization-json:1.5.0")
+    implementation ("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
 
     implementation("io.getstream:stream-webrtc-android-ui:1.3.8")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
