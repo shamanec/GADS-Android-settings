@@ -27,6 +27,8 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
+import org.webrtc.MediaStreamTrack
+import org.webrtc.RtpParameters
 import org.webrtc.RtpTransceiver
 import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SessionDescription
@@ -197,6 +199,35 @@ class WebRTCScreenCaptureService : Service() {
         }
     }
 
+    private fun updatePeerConnectionConstraints() {
+        peerConnection?.let { pc ->
+            // Find the video sender
+            val videoSender = pc.connection.senders.find {
+                it.track()?.kind() == MediaStreamTrack.VIDEO_TRACK_KIND
+            }
+
+            videoSender?.let { sender ->
+                val parameters = sender.parameters
+
+                // Update encoding parameters
+                parameters.encodings?.forEach { encoding ->
+                    encoding.maxBitrateBps = 1_000_000
+                    encoding.minBitrateBps = 5_000_000
+                    encoding.maxFramerate = 60
+
+                    // Enable scalability for better adaptation
+                    encoding.scalabilityMode = "L1T1" // 3 temporal, 3 spatial layers
+
+                    // Ensure active
+                    encoding.active = true
+                }
+
+                // Apply updated parameters
+                sender.parameters = parameters
+            }
+        }
+    }
+
     /**
      * Send an answer to the React UI client
      */
@@ -217,6 +248,50 @@ class WebRTCScreenCaptureService : Service() {
         // Update the transceivers direction because we only send video, we don't expect to receive
         peerConnection?.connection?.transceivers?.forEach { transceiver ->
             transceiver.setDirection(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY)
+            // Configure single stream with adaptive bitrate
+            val sender = transceiver.sender
+            val parameters = sender.parameters
+
+            // Get existing encoding or create new one
+            val encoding = if (parameters.encodings.isNotEmpty()) {
+                parameters.encodings[0]
+            } else {
+                // Create new encoding with default values
+                RtpParameters.Encoding(null, true, 1.0).also {
+                    parameters.encodings.add(it)
+                }
+            }
+
+            // Configure the encoding
+            encoding.apply {
+                // Bitrate settings
+                minBitrateBps = 1_000_000
+                maxBitrateBps = 5_000_000
+                maxFramerate = 60
+                // No resolution scaling for screen share
+                scaleResolutionDownBy = 1.0
+
+                // Ensure encoding is active
+                active = true
+
+                // Try to set scalability mode if supported
+                try {
+                    scalabilityMode = "L1T1"
+                } catch (e: Exception) {
+                    Log.w("ASD", "Scalability mode not supported: ${e.message}")
+                }
+            }
+
+            // Set degradation preference if supported
+            try {
+                // Maintain framerate at all costs for responsiveness
+                RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
+            } catch (e: Exception) {
+                Log.w("ASD", "Degradation preference not supported: ${e.message}")
+            }
+
+            // Apply the parameters
+            sender.parameters = parameters
         }
 
         setRemoteResult?.onSuccess {
@@ -225,7 +300,8 @@ class WebRTCScreenCaptureService : Service() {
             // Set the answer as a local description
             val result = peerConnection?.setLocalDescription(answer!!)
 
-            peerConnection?.connection?.setBitrate(300_000, 300_000, 4_000_000)
+            peerConnection?.connection?.setBitrate(1_000_000, 300_000, 5_000_000)
+            updatePeerConnectionConstraints()
 
             // If setting answer as local description was successful
             result?.onSuccess {
@@ -270,15 +346,15 @@ class WebRTCScreenCaptureService : Service() {
         Thread.sleep(500)
         Log.d("CHANGE", "$streamWidth : $streamHeight")
         Log.d("CHANGE", "$lastKnownRotation")
-        streamWidth = metrics.widthPixels / 3
-        streamHeight = metrics.heightPixels / 3
+        streamWidth = metrics.widthPixels / 2
+        streamHeight = metrics.heightPixels / 2
         // Now restart capturing with the new resolution
         try {
             Log.d(
                 "ScreenCaptureService",
                 "Restarting capture at ${streamWidth}x${streamHeight}"
             )
-            screenCapturer.startCapture(streamWidth, streamHeight, 40)
+            screenCapturer.startCapture(streamWidth, streamHeight, 60)
         } catch (e: Exception) {
             Log.e("ScreenCaptureService", "Error restarting capture: ${e.message}")
         }
@@ -350,8 +426,8 @@ class WebRTCScreenCaptureService : Service() {
         val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         val mDisplay = windowManager.getDefaultDisplay()
         mDisplay.getRealMetrics(metrics)
-        streamWidth = metrics.widthPixels / 3
-        streamHeight = metrics.heightPixels / 3
+        streamWidth = metrics.widthPixels / 2
+        streamHeight = metrics.heightPixels / 2
 
         screenCapturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() {
             override fun onStop() {
@@ -360,9 +436,14 @@ class WebRTCScreenCaptureService : Service() {
         })
 
         videoSource = peerConnectionFactory.makeVideoSource(screenCapturer.isScreencast).apply {
+            adaptOutputFormat(
+                streamWidth,
+                streamHeight,
+                60
+            )
             screenCapturer.initialize(surfaceTextureHelper, this@WebRTCScreenCaptureService, capturerObserver)
             try {
-                screenCapturer.startCapture(streamWidth, streamHeight, 40)
+                screenCapturer.startCapture(streamWidth, streamHeight, 60)
             } catch (e: Exception) {
                 Log.e("WebRTC", "❌ ScreenCapturer failed to start: ${e.message}")
             }
