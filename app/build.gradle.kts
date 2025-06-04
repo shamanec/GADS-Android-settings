@@ -9,6 +9,13 @@ android {
     namespace = "com.gads.settings"
     compileSdk = 35
 
+    applicationVariants.all {
+        outputs.all {
+            val outputImpl = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
+            outputImpl.outputFileName = "gads-settings.apk"
+        }
+    }
+
     defaultConfig {
         applicationId = "com.gads.settings"
         minSdk = 24
