@@ -346,8 +346,8 @@ class WebRTCScreenCaptureService : Service() {
         Thread.sleep(500)
         Log.d("CHANGE", "$streamWidth : $streamHeight")
         Log.d("CHANGE", "$lastKnownRotation")
-        streamWidth = metrics.widthPixels / 2
-        streamHeight = metrics.heightPixels / 2
+        streamWidth = metrics.widthPixels / 3
+        streamHeight = metrics.heightPixels / 3
         // Now restart capturing with the new resolution
         try {
             Log.d(
@@ -426,8 +426,8 @@ class WebRTCScreenCaptureService : Service() {
         val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         val mDisplay = windowManager.getDefaultDisplay()
         mDisplay.getRealMetrics(metrics)
-        streamWidth = metrics.widthPixels / 2
-        streamHeight = metrics.heightPixels / 2
+        streamWidth = metrics.widthPixels / 3
+        streamHeight = metrics.heightPixels / 3
 
         screenCapturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() {
             override fun onStop() {
