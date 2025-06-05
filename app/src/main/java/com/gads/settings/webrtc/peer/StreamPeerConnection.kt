@@ -1,19 +1,3 @@
-/*
- * Copyright 2023 Stream.IO, Inc. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.gads.settings.webrtc.peer
 
 import android.util.Log
@@ -64,6 +48,7 @@ class StreamPeerConnection(
 ) : PeerConnection.Observer {
 
   private val typeTag = type.stringify()
+  private val TAG = "GADS WebRTC"
 
   /**
    * The wrapped connection for all the WebRTC communication.
@@ -88,8 +73,8 @@ class StreamPeerConnection(
   private val statsFlow: MutableStateFlow<RTCStatsReport?> = MutableStateFlow(null)
 
   init {
-    Log.d("KOLEO", "<init> #sfu; #$typeTag; mediaConstraints: $mediaConstraints")
-    Log.d("Koleo", "")
+    Log.d(TAG, "<init> #sfu; #$typeTag; mediaConstraints: $mediaConstraints")
+    Log.d(TAG, "")
   }
 
   /**
@@ -98,7 +83,7 @@ class StreamPeerConnection(
    * @param peerConnection The connection that holds audio and video tracks.
    */
   fun initialize(peerConnection: PeerConnection) {
-    Log.d("Koleo", "[initialize] #sfu; #$typeTag; peerConnection: $peerConnection")
+    Log.d(TAG, "[initialize] #sfu; #$typeTag; peerConnection: $peerConnection")
     this.connection = peerConnection
   }
 
@@ -109,7 +94,7 @@ class StreamPeerConnection(
    * @return [Result] wrapper of the [SessionDescription] for the publisher.
    */
   suspend fun createOffer(): Result<SessionDescription> {
-    Log.d("Koleo", "[createOffer] #sfu; #$typeTag; no args")
+    Log.d(TAG, "[createOffer] #sfu; #$typeTag; no args")
     return createValue { connection.createOffer(it, mediaConstraints) }
   }
 
@@ -119,7 +104,7 @@ class StreamPeerConnection(
    * @return [Result] wrapper of the [SessionDescription] for the subscriber.
    */
   suspend fun createAnswer(): Result<SessionDescription> {
-    Log.d("Koleo", "[createAnswer] #sfu; #$typeTag; no args")
+    Log.d(TAG, "[createAnswer] #sfu; #$typeTag; no args")
     return createValue { connection.createAnswer(it, mediaConstraints) }
   }
 
@@ -131,7 +116,7 @@ class StreamPeerConnection(
    * @return An empty [Result], if the operation has been successful or not.
    */
   suspend fun setRemoteDescription(sessionDescription: SessionDescription): Result<Unit> {
-    Log.d("Koleo", "[setRemoteDescription] #sfu; #$typeTag; answerSdp: ${sessionDescription.stringify()}")
+    Log.d(TAG, "[setRemoteDescription] #sfu; #$typeTag; answerSdp: ${sessionDescription.stringify()}")
     return setValue {
       connection.setRemoteDescription(
         it,
@@ -143,7 +128,7 @@ class StreamPeerConnection(
     }.also {
       pendingIceMutex.withLock {
         pendingIceCandidates.forEach { iceCandidate ->
-          Log.d("Koleo", "[setRemoteDescription] #sfu; #subscriber; pendingRtcIceCandidate: $iceCandidate")
+          Log.d(TAG, "[setRemoteDescription] #sfu; #subscriber; pendingRtcIceCandidate: $iceCandidate")
           connection.addRtcIceCandidate(iceCandidate)
         }
         pendingIceCandidates.clear()
@@ -163,7 +148,7 @@ class StreamPeerConnection(
       sessionDescription.type,
       sessionDescription.description.mungeCodecs()
     )
-    Log.d("Koleo", "[setLocalDescription] #sfu; #$typeTag; offerSdp: ${sessionDescription.stringify()}")
+    Log.d(TAG, "[setLocalDescription] #sfu; #$typeTag; offerSdp: ${sessionDescription.stringify()}")
     return setValue { connection.setLocalDescription(it, sdp) }
   }
 
@@ -176,15 +161,15 @@ class StreamPeerConnection(
    */
   suspend fun addIceCandidate(iceCandidate: IceCandidate): Result<Unit> {
     if (connection.remoteDescription == null) {
-      Log.d("Koleo", "[addIceCandidate] #sfu; #$typeTag; postponed (no remoteDescription): $iceCandidate")
+      Log.d(TAG, "[addIceCandidate] #sfu; #$typeTag; postponed (no remoteDescription): $iceCandidate")
       pendingIceMutex.withLock {
         pendingIceCandidates.add(iceCandidate)
       }
       return Result.failure(RuntimeException("RemoteDescription is not set"))
     }
-    Log.d("Koleo", "[addIceCandidate] #sfu; #$typeTag; rtcIceCandidate: $iceCandidate")
+    Log.d(TAG, "[addIceCandidate] #sfu; #$typeTag; rtcIceCandidate: $iceCandidate")
     return connection.addRtcIceCandidate(iceCandidate).also {
-      Log.d("Koleo", "[addIceCandidate] #sfu; #$typeTag; completed: $it")
+      Log.d(TAG, "[addIceCandidate] #sfu; #$typeTag; completed: $it")
     }
   }
 
@@ -199,7 +184,7 @@ class StreamPeerConnection(
    * @param candidate The new candidate.
    */
   override fun onIceCandidate(candidate: IceCandidate?) {
-    Log.d("Koleo", "[onIceCandidate] #sfu; #$typeTag; candidate: $candidate")
+    Log.d(TAG, "[onIceCandidate] #sfu; #$typeTag; candidate: $candidate")
     if (candidate == null) return
 
     onIceCandidate?.invoke(candidate, type)
@@ -211,7 +196,7 @@ class StreamPeerConnection(
    * @param stream The stream that contains audio or video.
    */
   override fun onAddStream(stream: MediaStream?) {
-    Log.d("Koleo", "[onAddStream] #sfu; #$typeTag; stream: $stream")
+    Log.d(TAG, "[onAddStream] #sfu; #$typeTag; stream: $stream")
     if (stream != null) {
       onStreamAdded?.invoke(stream)
     }
@@ -225,11 +210,11 @@ class StreamPeerConnection(
    * @param mediaStreams The streams that were added containing their appropriate tracks.
    */
   override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {
-    Log.d("Koleo", "[onAddTrack] #sfu; #$typeTag; receiver: $receiver, mediaStreams: $mediaStreams")
+    Log.d(TAG, "[onAddTrack] #sfu; #$typeTag; receiver: $receiver, mediaStreams: $mediaStreams")
     mediaStreams?.forEach { mediaStream ->
-      Log.d("Koleo", "[onAddTrack] #sfu; #$typeTag; mediaStream: $mediaStream")
+      Log.d(TAG, "[onAddTrack] #sfu; #$typeTag; mediaStream: $mediaStream")
       mediaStream.audioTracks?.forEach { remoteAudioTrack ->
-        Log.d("Koleo", "[onAddTrack] #sfu; #$typeTag; remoteAudioTrack: ${remoteAudioTrack.stringify()}")
+        Log.d(TAG, "[onAddTrack] #sfu; #$typeTag; remoteAudioTrack: ${remoteAudioTrack.stringify()}")
         remoteAudioTrack.setEnabled(true)
       }
       onStreamAdded?.invoke(mediaStream)
@@ -240,7 +225,7 @@ class StreamPeerConnection(
    * Triggered whenever there's a new negotiation needed for the active [PeerConnection].
    */
   override fun onRenegotiationNeeded() {
-    Log.d("Koleo", "[onRenegotiationNeeded] #sfu; #$typeTag; no args")
+    Log.d(TAG, "[onRenegotiationNeeded] #sfu; #$typeTag; no args")
     onNegotiationNeeded?.invoke(this, type)
   }
 
@@ -257,7 +242,7 @@ class StreamPeerConnection(
    * @param newState The new state of the [PeerConnection].
    */
   override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
-    Log.d("Koleo", "[onIceConnectionChange] #sfu; #$typeTag; newState: $newState")
+    Log.d(TAG, "[onIceConnectionChange] #sfu; #$typeTag; newState: $newState")
     when (newState) {
       PeerConnection.IceConnectionState.CLOSED,
       PeerConnection.IceConnectionState.FAILED,
@@ -281,14 +266,14 @@ class StreamPeerConnection(
     while (isActive) {
       delay(10_000L)
       connection.getStats {
-        Log.d("Koleo", "[observeStats] #sfu; #$typeTag; stats: $it")
+        Log.d(TAG, "[observeStats] #sfu; #$typeTag; stats: $it")
         statsFlow.value = it
       }
     }
   }
 
   override fun onTrack(transceiver: RtpTransceiver?) {
-    Log.d("Koleo", "[onTrack] #sfu; #$typeTag; transceiver: $transceiver")
+    Log.d(TAG, "[onTrack] #sfu; #$typeTag; transceiver: $transceiver")
     onVideoTrack?.invoke(transceiver)
   }
 
@@ -296,35 +281,35 @@ class StreamPeerConnection(
    * Domain - [PeerConnection] and [PeerConnection.Observer] related callbacks.
    */
   override fun onRemoveTrack(receiver: RtpReceiver?) {
-    Log.d("Koleo", "[onRemoveTrack] #sfu; #$typeTag; receiver: $receiver")
+    Log.d(TAG, "[onRemoveTrack] #sfu; #$typeTag; receiver: $receiver")
   }
 
   override fun onSignalingChange(newState: PeerConnection.SignalingState?) {
-    Log.d("Koleo", "[onSignalingChange] #sfu; #$typeTag; newState: $newState")
+    Log.d(TAG, "[onSignalingChange] #sfu; #$typeTag; newState: $newState")
   }
 
   override fun onIceConnectionReceivingChange(receiving: Boolean) {
-    Log.d("Koleo", "[onIceConnectionReceivingChange] #sfu; #$typeTag; receiving: $receiving")
+    Log.d(TAG, "[onIceConnectionReceivingChange] #sfu; #$typeTag; receiving: $receiving")
   }
 
   override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {
-    Log.d("Koleo", "[onIceGatheringChange] #sfu; #$typeTag; newState: $newState")
+    Log.d(TAG, "[onIceGatheringChange] #sfu; #$typeTag; newState: $newState")
   }
 
   override fun onIceCandidatesRemoved(iceCandidates: Array<out org.webrtc.IceCandidate>?) {
-    Log.d("Koleo", "[onIceCandidatesRemoved] #sfu; #$typeTag; iceCandidates: $iceCandidates")
+    Log.d(TAG, "[onIceCandidatesRemoved] #sfu; #$typeTag; iceCandidates: $iceCandidates")
   }
 
   override fun onIceCandidateError(event: IceCandidateErrorEvent?) {
-    Log.d("Koleo", "[onIceCandidateError] #sfu; #$typeTag; event: ${event?.stringify()}")
+    Log.d(TAG, "[onIceCandidateError] #sfu; #$typeTag; event: ${event?.stringify()}")
   }
 
   override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
-    Log.d("Koleo", "[onConnectionChange] #sfu; #$typeTag; newState: $newState")
+    Log.d(TAG, "[onConnectionChange] #sfu; #$typeTag; newState: $newState")
   }
 
   override fun onSelectedCandidatePairChanged(event: CandidatePairChangeEvent?) {
-    Log.d("Koleo", "[onSelectedCandidatePairChanged] #sfu; #$typeTag; event: $event")
+    Log.d(TAG, "[onSelectedCandidatePairChanged] #sfu; #$typeTag; event: $event")
   }
 
   override fun onDataChannel(channel: DataChannel?): Unit = Unit

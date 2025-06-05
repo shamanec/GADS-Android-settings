@@ -37,24 +37,39 @@ import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 import java.util.UUID
 
-
 class WebRTCScreenCaptureService : Service() {
-    private var projectionIntent: Intent? = null
+    private val TAG = "GADS WebRTC"
+    // Socket server
+    private var server: WebRTCWebsocketServer = WebRTCWebsocketServer(1991, this)
+
+    // Handler
     private var mHandler: Handler? = null
+
+    // Projection properties
+    private var projectionIntent: Intent? = null
+    private var orientationEventListener: OrientationEventListener? = null
+    private var lastKnownRotation: Int = ROTATION_0  // default
+
+    // Screen metrics
     private var metrics: DisplayMetrics = DisplayMetrics()
     private var streamWidth: Int = 0
     private var streamHeight: Int = 0
 
-    var server: WebRTCWebsocketServer = WebRTCWebsocketServer(1991, this)
-    private var orientationEventListener: OrientationEventListener? = null
-    private var lastKnownRotation: Int = ROTATION_0  // default
-
+    // Session and connection
     private lateinit var offer: SessionDescription
-    var peerConnectionFactory: StreamPeerConnectionFactory = StreamPeerConnectionFactory(this)
+    private var peerConnection: StreamPeerConnection? = null
+    private var peerConnectionFactory: StreamPeerConnectionFactory = StreamPeerConnectionFactory(this)
     private val sessionManagerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    // Screen and video
+    private lateinit var screenCapturer: ScreenCapturerAndroid
+    private lateinit var videoSource: VideoSource
+    private lateinit var localVideoTrack: VideoTrack
     private val _localVideoTrackFlow = MutableSharedFlow<VideoTrack>()
-
+    private var surfaceTextureHelper = SurfaceTextureHelper.create(
+        "SurfaceTextureHelperThread",
+        peerConnectionFactory.eglBaseContext
+    )
     private val mediaConstraints = MediaConstraints().apply {
         mandatory.addAll(
             listOf(
@@ -64,19 +79,39 @@ class WebRTCScreenCaptureService : Service() {
         )
     }
 
-    private var surfaceTextureHelper = SurfaceTextureHelper.create(
-        "SurfaceTextureHelperThread",
-        peerConnectionFactory.eglBaseContext
-    )
-    private lateinit var screenCapturer: ScreenCapturerAndroid
+    companion object {
+        fun getStartIntent(context: Context?, resultCode: Int, data: Intent?): Intent {
+            val intent = Intent(
+                context,
+                WebRTCScreenCaptureService::class.java
+            )
+            intent.putExtra("ACTION", "START")
+            intent.putExtra("RESULT_CODE", resultCode)
+            intent.putExtra("DATA", data)
+            return intent
+        }
 
-    private lateinit var videoSource: VideoSource
-    private lateinit var localVideoTrack: VideoTrack
+        fun getStopIntent(context: Context?): Intent {
+            val intent = Intent(
+                context,
+                WebRTCScreenCaptureService::class.java
+            )
+            intent.putExtra("ACTION", "STOP")
+            return intent
+        }
 
-    private var peerConnection: StreamPeerConnection? = null
+        private fun isStartCommand(intent: Intent): Boolean {
+            return intent.hasExtra("RESULT_CODE") && intent.hasExtra("DATA")
+                    && intent.hasExtra("ACTION") && intent.getStringExtra("ACTION") == "START"
+        }
+
+        private fun isStopCommand(intent: Intent): Boolean {
+            return intent.hasExtra("ACTION") && intent.getStringExtra("ACTION") == "STOP"
+        }
+    }
 
     init {
-        server.setReuseAddr(true)
+        server.isReuseAddr = true
         server.start()
     }
 
@@ -107,7 +142,7 @@ class WebRTCScreenCaptureService : Service() {
                 val rotation = wm.defaultDisplay.rotation
 
                 if (rotation != lastKnownRotation) {
-                    Log.d("ScreenCaptureService", "Orientation changed.")
+                    Log.d(TAG, "OrientationEventListener: Orientation changed from `$lastKnownRotation` to `$rotation`")
                     lastKnownRotation = rotation
                     updateCaptureResolution()
                 }
@@ -120,7 +155,6 @@ class WebRTCScreenCaptureService : Service() {
 
     // The onStartCommand() method is called by the Android system when the service is started
     override fun onStartCommand(intent: Intent, flags: Int, startId: Int): Int {
-        Log.d("GADS-WebRTC", "onStartCommand called with $intent")
         // Keep the intent for multiple projection start ups
         val data = intent.getParcelableExtra<Intent>("DATA")
         projectionIntent = data
@@ -144,7 +178,7 @@ class WebRTCScreenCaptureService : Service() {
     }
 
     fun setReceivedOffer(offerMsg: String) {
-        Log.d("GADS-WebRTC", "Received offer: " + offerMsg)
+        Log.d(TAG, "setReceivedOffer: Received offer - $offerMsg")
         // Parse the offer SDP from the received message from the React UI client
         val offerJson = JSONObject(offerMsg)
         val sdp = offerJson.getString("sdp")
@@ -231,12 +265,12 @@ class WebRTCScreenCaptureService : Service() {
     /**
      * Send an answer to the React UI client
      */
-    suspend fun sendAnswer() {
+    private suspend fun sendAnswer() {
         // Set the offer from the React UI client as remote description
         val setRemoteResult = peerConnection?.setRemoteDescription(offer)
 
         if (!::localVideoTrack.isInitialized) {
-            Log.e("WebRTC", "❌ localVideoTrack is not initialized!")
+            Log.e(TAG, "sendAnswer: localVideoTrack is not initialized!")
             return
         }
 
@@ -278,7 +312,7 @@ class WebRTCScreenCaptureService : Service() {
                 try {
                     scalabilityMode = "L1T1"
                 } catch (e: Exception) {
-                    Log.w("ASD", "Scalability mode not supported: ${e.message}")
+                    Log.w(TAG, "sendAnswer: Scalability mode L1T1 not supported: ${e.message}")
                 }
             }
 
@@ -287,7 +321,7 @@ class WebRTCScreenCaptureService : Service() {
                 // Maintain framerate at all costs for responsiveness
                 RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
             } catch (e: Exception) {
-                Log.w("ASD", "Degradation preference not supported: ${e.message}")
+                Log.w(TAG, "sendAnswer: Degradation preference not supported: ${e.message}")
             }
 
             // Apply the parameters
@@ -316,14 +350,13 @@ class WebRTCScreenCaptureService : Service() {
                 }.toString()
                 // Send the answer JSON over the websocket to the signalling server
                 server.sendMessage(jsonAnswer)
-                Log.d("WebRTC", "Answer created and sent.")
+                Log.d(TAG, "sendAnswer: Answer created and sent.")
             }?.onFailure {
-                Log.e("WebRTC", "❌ Failed to set local description: ${it.message}")
+                Log.e(TAG, "sendAnswer: Failed to set local description: ${it.message}")
             }
+        }?.onFailure {
+                Log.e(TAG, "sendAnswer: Failed to set remote description: ${it.message}")
         }
-            ?.onFailure {
-                Log.e("WebRTC", "❌ Failed to set remote description: ${it.message}")
-            }
     }
 
     /**
@@ -336,7 +369,7 @@ class WebRTCScreenCaptureService : Service() {
         try {
             screenCapturer.stopCapture()
         } catch (e: Exception) {
-            Log.e("ScreenCaptureService", "Error stopping capture: ${e.message}")
+            Log.e(TAG, "updateCaptureResolution: Error stopping capture: ${e.message}")
         }
 
         // Recompute the display metrics
@@ -344,19 +377,14 @@ class WebRTCScreenCaptureService : Service() {
         windowManager.defaultDisplay.getRealMetrics(metrics)
 
         Thread.sleep(500)
-        Log.d("CHANGE", "$streamWidth : $streamHeight")
-        Log.d("CHANGE", "$lastKnownRotation")
         streamWidth = metrics.widthPixels / 3
         streamHeight = metrics.heightPixels / 3
         // Now restart capturing with the new resolution
         try {
-            Log.d(
-                "ScreenCaptureService",
-                "Restarting capture at ${streamWidth}x${streamHeight}"
-            )
+            Log.d(TAG, "updateCaptureResolution: Restarting capture at ${streamWidth}x${streamHeight}")
             screenCapturer.startCapture(streamWidth, streamHeight, 60)
         } catch (e: Exception) {
-            Log.e("ScreenCaptureService", "Error restarting capture: ${e.message}")
+            Log.e(TAG, "updateCaptureResolution: Error restarting capture: ${e.message}")
         }
     }
 
@@ -382,8 +410,8 @@ class WebRTCScreenCaptureService : Service() {
                         val framesEncoded = singleStat.members["framesEncoded"]?.toString()
                         val framesDropped = singleStat.members["framesDropped"]?.toString()
 
-                        Log.d("WebRTC-Stats", """
-                [Outbound RTP] 
+                        Log.d(TAG, """
+                observeStatsPeriodically: [Outbound RTP] 
                 qualityLimitationReason: $qualityReason
                 framesEncoded: $framesEncoded
                 framesDropped: $framesDropped
@@ -395,7 +423,7 @@ class WebRTCScreenCaptureService : Service() {
     }
 
     fun handleHangup() {
-        Log.d("ScreenCaptureService", "Handling hangup...")
+        Log.d(TAG, "Handling hangup...")
 
         sessionManagerScope.launch {
             peerConnection?.connection?.close()
@@ -405,7 +433,7 @@ class WebRTCScreenCaptureService : Service() {
         try {
             screenCapturer.stopCapture()
         } catch (e: Exception) {
-            Log.e("WebRTC", "Failed to stop screen capture: ${e.message}")
+            Log.e(TAG, "handleHangup: Failed to stop screen capture: ${e.message}")
         }
 
         localVideoTrack.setEnabled(false)
@@ -418,20 +446,20 @@ class WebRTCScreenCaptureService : Service() {
             peerConnectionFactory.eglBaseContext
         )
 
-        Log.d("ScreenCaptureService", "Hangup handled, stream stopped.")
+        Log.d(TAG, "handleHangup: Successfully handled hangup, stream stopped.")
     }
 
     // Set up a media projection by obtaining a MediaProjection object and creating a virtual display
     private fun startProjection(data: Intent?) {
         val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        val mDisplay = windowManager.getDefaultDisplay()
+        val mDisplay = windowManager.defaultDisplay
         mDisplay.getRealMetrics(metrics)
         streamWidth = metrics.widthPixels / 3
         streamHeight = metrics.heightPixels / 3
 
         screenCapturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() {
             override fun onStop() {
-                Log.d("KOLEO", "SHARING STOPPED")
+                Log.d(TAG, "startProjection: Stopped sharing")
             }
         })
 
@@ -445,7 +473,7 @@ class WebRTCScreenCaptureService : Service() {
             try {
                 screenCapturer.startCapture(streamWidth, streamHeight, 60)
             } catch (e: Exception) {
-                Log.e("WebRTC", "❌ ScreenCapturer failed to start: ${e.message}")
+                Log.e(TAG, "startProjection: ScreenCapturer failed to start: ${e.message}")
             }
         }
 
@@ -457,37 +485,6 @@ class WebRTCScreenCaptureService : Service() {
 
         sessionManagerScope.launch {
             _localVideoTrackFlow.emit(localVideoTrack)
-        }
-    }
-
-    companion object {
-        fun getStartIntent(context: Context?, resultCode: Int, data: Intent?): Intent {
-            val intent = Intent(
-                context,
-                WebRTCScreenCaptureService::class.java
-            )
-            intent.putExtra("ACTION", "START")
-            intent.putExtra("RESULT_CODE", resultCode)
-            intent.putExtra("DATA", data)
-            return intent
-        }
-
-        fun getStopIntent(context: Context?): Intent {
-            val intent = Intent(
-                context,
-                WebRTCScreenCaptureService::class.java
-            )
-            intent.putExtra("ACTION", "STOP")
-            return intent
-        }
-
-        private fun isStartCommand(intent: Intent): Boolean {
-            return intent.hasExtra("RESULT_CODE") && intent.hasExtra("DATA")
-                    && intent.hasExtra("ACTION") && intent.getStringExtra("ACTION") == "START"
-        }
-
-        private fun isStopCommand(intent: Intent): Boolean {
-            return intent.hasExtra("ACTION") && intent.getStringExtra("ACTION") == "STOP"
         }
     }
 }

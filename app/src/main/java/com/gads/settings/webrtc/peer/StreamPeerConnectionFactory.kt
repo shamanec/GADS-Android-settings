@@ -1,30 +1,12 @@
-/*
- * Copyright 2023 Stream.IO, Inc. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.gads.settings.webrtc.peer
 
 import android.app.ActivityManager
 import android.content.Context
-import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
 import org.webrtc.DefaultAlignedVideoEncoderFactory
-import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.Logging
@@ -37,14 +19,12 @@ import org.webrtc.RtpTransceiver
 import org.webrtc.SoftwareVideoEncoderFactory
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
-import org.webrtc.audio.JavaAudioDeviceModule
-import kotlin.math.log
 
-class StreamPeerConnectionFactory constructor(
+class StreamPeerConnectionFactory(
     private val context: Context
 ) {
 
-    private val logTag = "GADS WebRTC"
+    private val TAG = "GADS WebRTC"
     val eglBaseContext: EglBase.Context by lazy {
         EglBase.create().eglBaseContext
     }
@@ -52,9 +32,9 @@ class StreamPeerConnectionFactory constructor(
     private fun isLowEndDevice(): Boolean {
         val cores = Runtime.getRuntime().availableProcessors()
         val ramGB = getTotalRAMFromAPI(context).toDouble() / (1024 * 1024 * 1024)
-        Log.d(logTag, "Number of cores: $cores")
-        Log.d(logTag, "Ram GB: $ramGB")
-        Log.d(logTag, "Runtime memory: ${getTotalRAMFromAPI(context)}")
+        Log.d(TAG, "Number of cores: $cores")
+        Log.d(TAG, "Ram GB: $ramGB")
+        Log.d(TAG, "Runtime memory: ${getTotalRAMFromAPI(context)}")
 
         return cores < 4 || ramGB < 2
     }
@@ -73,10 +53,10 @@ class StreamPeerConnectionFactory constructor(
         val isLowEnd = isLowEndDevice()
 
         if (isLowEnd) {
-            Log.d(logTag, "Using software encoder for low-end device")
+            Log.d(TAG, "Using software encoder for low-end device")
             SoftwareVideoEncoderFactory()
         } else {
-            Log.d(logTag, "Using hardware encoder")
+            Log.d(TAG, "Using hardware encoder")
             DefaultAlignedVideoEncoderFactory(
                 eglContext = eglBaseContext,
                 enableIntelVp8Encoder = true,
@@ -128,19 +108,19 @@ class StreamPeerConnectionFactory constructor(
                         }
 
                         Logging.Severity.LS_INFO -> {
-                            Log.d(logTag, "[onLogMessage] label: $label, message: $message")
+                            Log.d(TAG, "[onLogMessage] label: $label, message: $message")
                         }
 
                         Logging.Severity.LS_WARNING -> {
-                            Log.d(logTag, "[onLogMessage] label: $label, message: $message")
+                            Log.d(TAG, "[onLogMessage] label: $label, message: $message")
                         }
 
                         Logging.Severity.LS_ERROR -> {
-                            Log.d(logTag, "[onLogMessage] label: $label, message: $message")
+                            Log.d(TAG, "[onLogMessage] label: $label, message: $message")
                         }
 
                         Logging.Severity.LS_NONE -> {
-                            Log.d(logTag, "[onLogMessage] label: $label, message: $message")
+                            Log.d(TAG, "[onLogMessage] label: $label, message: $message")
                         }
 
                         else -> {}
