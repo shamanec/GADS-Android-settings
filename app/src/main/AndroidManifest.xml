@@ -32,10 +32,20 @@
         </service>
 
         <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.AppCompat.Light.NoActionBar"
+            android:excludeFromRecents="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
             android:name=".streaming.MjpegScreenCaptureActivity"
             android:configChanges="orientation|screenSize"
             android:exported="true"
-            android:label="GADS Settings"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:excludeFromRecents="true">
             <intent-filter>
@@ -47,7 +57,6 @@
             android:name=".webrtc.WebRTCScreenCaptureActivity"
             android:configChanges="orientation|screenSize"
             android:exported="true"
-            android:label="GADS Settings"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:excludeFromRecents="true">
             <intent-filter>
