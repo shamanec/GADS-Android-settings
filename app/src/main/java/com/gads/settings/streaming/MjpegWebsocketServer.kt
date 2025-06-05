@@ -7,6 +7,7 @@ import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 
 class MjpegWebsocketServer(port: Int, private val screenCaptureService: MjpegScreenCaptureService): org.java_websocket.server.WebSocketServer(InetSocketAddress(port)) {
+    private val TAG = "GADS Mjpeg server"
     override fun onOpen(conn: WebSocket?, handshake: ClientHandshake?) {
     }
 
@@ -26,13 +27,10 @@ class MjpegWebsocketServer(port: Int, private val screenCaptureService: MjpegScr
                     val fps = currentMsgPart.split("=".toRegex()).dropLastWhile { it.isEmpty() }
                         .toTypedArray()[1].toInt()
                     // Update the targetFPS in ScreenCaptureService
-                    screenCaptureService?.setTargetFPS(fps)
+                    screenCaptureService.setTargetFPS(fps)
                 } catch (e: NumberFormatException) {
                     e.printStackTrace()
-                    Log.e(
-                        "LocalWebsocketServer",
-                        "Invalid FPS value received: $currentMsgPart"
-                    )
+                    Log.e(TAG, "Invalid FPS value received: $currentMsgPart")
                 }
             }
             if (currentMsgPart.startsWith("jpegQuality=")) {
@@ -42,12 +40,10 @@ class MjpegWebsocketServer(port: Int, private val screenCaptureService: MjpegScr
                         currentMsgPart.split("=".toRegex()).dropLastWhile { it.isEmpty() }
                             .toTypedArray()[1].toInt()
                     // Update the jpegQuality in ScreenCaptureService
-                    screenCaptureService?.setJpegQuality(jpegQuality)
+                    screenCaptureService.setJpegQuality(jpegQuality)
                 } catch (e: NumberFormatException) {
                     e.printStackTrace()
-                    Log.e(
-                        "LocalWebsocketServer",
-                        "Invalid JPEG quality value received: $currentMsgPart"
+                    Log.e(TAG, "Invalid JPEG quality value received: $currentMsgPart"
                     )
                 }
             }
@@ -58,13 +54,10 @@ class MjpegWebsocketServer(port: Int, private val screenCaptureService: MjpegScr
                         currentMsgPart.split("=".toRegex()).dropLastWhile { it.isEmpty() }
                             .toTypedArray()[1].toInt()
                     // Update the scalingFactor in ScreenCaptureService
-                    screenCaptureService?.setScalingFactor(scalingFactor)
+                    screenCaptureService.setScalingFactor(scalingFactor)
                 } catch (e: NumberFormatException) {
                     e.printStackTrace()
-                    Log.e(
-                        "LocalWebsocketServer",
-                        "Invalid scaling factor value received: $currentMsgPart"
-                    )
+                    Log.e(TAG, "Invalid scaling factor value received: $currentMsgPart")
                 }
             }
         }
@@ -76,6 +69,7 @@ class MjpegWebsocketServer(port: Int, private val screenCaptureService: MjpegScr
     override fun onError(conn: WebSocket?, ex: Exception) {
         ex.printStackTrace()
         if (conn != null) {
+            return
             // TODO: Handle something here, like port binding failed or whatever
         }
     }

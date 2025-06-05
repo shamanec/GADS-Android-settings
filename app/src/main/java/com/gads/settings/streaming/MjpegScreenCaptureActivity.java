@@ -29,7 +29,7 @@ public class MjpegScreenCaptureActivity extends Activity {
                 startService(MjpegScreenCaptureService.Companion.getStartIntent(this, resultCode, data));
             }
         }
-        // Comment this to run via Android Studio
+        // Comment this to run via Android Studio, we use it to directly close the activity after the service was started
         finish();
     }
 

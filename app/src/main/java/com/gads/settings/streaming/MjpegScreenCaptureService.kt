@@ -49,7 +49,7 @@ class MjpegScreenCaptureService: Service() {
 
     var server: MjpegWebsocketServer? = null
 
-    val TAG: String = "ScreenCaptureService"
+    val TAG: String = "GADS Mjpeg"
 
     init {
         server = MjpegWebsocketServer(1991, this)
@@ -76,17 +76,17 @@ class MjpegScreenCaptureService: Service() {
     fun setTargetFPS(fps: Int) {
         this.targetFPS = fps
         this.frameIntervalMs = (1000 / fps).toLong()
-        Log.d("ScreenCaptureService", "Target FPS set to: " + this.targetFPS)
+        Log.d(TAG, "Target FPS set to: " + this.targetFPS)
     }
 
     fun setJpegQuality(jpegQuality: Int) {
         this.jpegQuality = jpegQuality
-        Log.d("ScreenCaptureService", "Jpeg quality set to: " + this.jpegQuality)
+        Log.d(TAG, "Jpeg quality set to: " + this.jpegQuality)
     }
 
     fun setScalingFactor(scalingFactor: Int) {
         this.scalingFactor = if (scalingFactor == 50) 2 else 4
-        Log.d("ScreenCaptureService", "Scaling factor set to: " + this.scalingFactor)
+        Log.d(TAG, "Scaling factor set to: " + this.scalingFactor)
     }
 
     private fun isStartCommand(intent: Intent): Boolean {
