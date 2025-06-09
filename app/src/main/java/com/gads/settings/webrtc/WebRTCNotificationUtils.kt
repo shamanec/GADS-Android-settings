@@ -12,8 +12,8 @@ import com.gads.settings.R
 
 object WebRTCNotificationUtils {
     const val NOTIFICATION_ID: Int = 1991
-    private const val NOTIFICATION_CHANNEL_ID = "com.shamanec.stream"
-    private const val NOTIFICATION_CHANNEL_NAME = "com.shamanec.stream"
+    private const val NOTIFICATION_CHANNEL_ID = "com.gads.settings"
+    private const val NOTIFICATION_CHANNEL_NAME = "com.gads.settings"
 
     // The getNotification method creates the notification channel and creates a notification with a low importance level.
     // It returns a Pair object containing the notification ID and the created notification.

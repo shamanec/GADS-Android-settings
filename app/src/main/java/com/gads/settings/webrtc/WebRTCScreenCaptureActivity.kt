@@ -8,7 +8,7 @@ import android.os.Bundle
 import com.gads.settings.R
 
 class WebRTCScreenCaptureActivity : Activity() {
-    //The onCreate method is an Android activity lifecycle method that gets called when the activity is created.
+    // The onCreate method is an Android activity lifecycle method that gets called when the activity is created.
     // In this case, it sets the layout for the activity and calls startProjection().
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,7 +35,7 @@ class WebRTCScreenCaptureActivity : Activity() {
             }
         }
 
-        // Comment this to run via Android Studio
+        // Comment this to run via Android Studio, we use it to directly close the activity after the service was started
         finish()
     }
 

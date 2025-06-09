@@ -3,13 +3,14 @@ package com.gads.settings
 import android.annotation.SuppressLint
 import android.os.Build
 import android.os.SystemClock
-import android.util.Base64
+import android.util.Log
 import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.annotation.RequiresApi
 import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
 import io.ktor.server.cio.*
 import io.ktor.server.engine.*
@@ -21,12 +22,16 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import org.json.JSONObject
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.lang.reflect.Method
 import java.util.concurrent.TimeUnit
 
+/**
+ * Function for executing shell commands on the device
+ */
 @RequiresApi(Build.VERSION_CODES.O)
 fun exec(
     cmd: String,
@@ -55,10 +60,32 @@ fun exec(
     return output
 }
 
+@Serializable
+data class TapRequest(val x: Float, val y: Float)
+
+@Serializable
+data class TouchAndHoldRequest(val x: Float, val y: Float, val duration: Long)
+
+@Serializable
+data class SwipeRequest(val x1: Float, val y1: Float, val x2: Float, val y2: Float, val duration: Int = 300)
+
+@Serializable
+data class StatusResponse(val status: String, val message: String? = null)
+
+@Serializable
+data class ScreenSizeResponse(val x: Int, val y: Int)
+
+@Serializable
+data class ClipboardResponse(val value: String)
+
+/**
+ * The ktor server accepting the requests for the remote control and data acquisition
+ */
 class RemoteControlServer(private val port: Int) {
     private val inputInjector = InputInjector()
     private var screenWidth: Int = 0
     private var screenHeight: Int = 0
+    private var logTag = "GADS Remote"
 
     @SuppressLint("NewApi")
     fun start() {
@@ -66,135 +93,177 @@ class RemoteControlServer(private val port: Int) {
         screenWidth = screenDimensions.first
         screenHeight = screenDimensions.second
 
+        val jsonFormatter = Json {
+            prettyPrint = false
+            ignoreUnknownKeys = true // skip unknown keys from incoming requests
+        }
+
         embeddedServer(CIO, port = port) {
+            install(io.ktor.server.plugins.contentnegotiation.ContentNegotiation) {
+                json(jsonFormatter)
+            }
+
             routing {
                 post("/tap") {
                     try {
-                        val body = call.receiveText()
-                        val json = JSONObject(body)
-                        val x = json.getDouble("x").toFloat()
-                        val y = json.getDouble("y").toFloat()
+                        val request = call.receive<TapRequest>()
+                        val x = request.x
+                        val y = request.y
 
-                        inputInjector.tap(x, y)
-                        call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                        try {
+                            Log.d(logTag, "Attempting to perform tap action at coordinates `$x:$y`")
+                            inputInjector.tap(x, y)
+                            call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully performed tap action"))
+                        } catch (e: Exception) {
+                            Log.e(logTag, "Internal error performing tap action: ${e.message}")
+                            call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed performing tap action - ${e.message}"))
+                        }
                     } catch (e: Exception) {
-                        println("Tap error: ${e.message}")
-                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                        Log.e(logTag, "Bad request performing tap action: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid tap request - ${e.message}"))
                     }
                 }
 
                 post("/touchAndHold") {
                     try {
-                        val body = call.receiveText()
-                        val json = JSONObject(body)
-                        val x = json.getDouble("x").toFloat()
-                        val y = json.getDouble("y").toFloat()
-                        val duration = json.getLong("duration")
+                        val request = call.receive<TouchAndHoldRequest>()
+                        val x = request.x
+                        val y = request.y
+                        val duration = request.duration
 
-                        inputInjector.touchAndHold(x, y, duration)
-                        call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                        Log.d(logTag, "Attempting to perform touch and hold action at coordinates `$x:$y` for duration $duration")
+                        try {
+                            inputInjector.touchAndHold(x, y, duration)
+                            call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully performed touch and hold action"))
+                        } catch(e: Exception) {
+                            Log.e(logTag, "Internal error performing touch and hold action: ${e.message}")
+                            call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed performing touch and hold action - ${e.message}"))
+                        }
                     } catch (e: Exception) {
-                        println("Tap error: ${e.message}")
-                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                        Log.e(logTag, "Bad request performing touch and hold action: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid touch and hold request - ${e.message}"))
                     }
                 }
 
                 post("/swipe") {
                     try {
-                        val body = call.receiveText()
-                        val json = JSONObject(body)
-                        val x1 = json.getDouble("x1").toFloat()
-                        val y1 = json.getDouble("y1").toFloat()
-                        val x2 = json.getDouble("x2").toFloat()
-                        val y2 = json.getDouble("y2").toFloat()
-                        val duration = json.optInt("duration", 300)
+                        val request = call.receive<SwipeRequest>()
+                        val x1 = request.x1
+                        val y1 = request.y1
+                        val x2 = request.x2
+                        val y2 = request.y2
+                        val duration = request.duration
 
-                        inputInjector.swipeAsync(x1, y1, x2, y2, duration)
-                        call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                        Log.d(logTag, "Attempting to perform swipe action from `$x1:$y1` to `$x2:$y2` for duration $duration")
+                        try {
+                            inputInjector.swipeAsync(x1, y1, x2, y2, duration)
+                            call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                        } catch (e: Exception) {
+                            Log.e(logTag, "Internal error performing swipe action: ${e.message}")
+                            call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed performing swipe action - ${e.message}"))
+                        }
                     } catch (e: Exception) {
-                        println("Swipe error: ${e.message}")
-                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                        Log.e(logTag, "Bad request performing swipe action: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid swipe request - ${e.message}"))
                     }
                 }
 
                 get("/screen-size") {
+                    Log.d(logTag, "Getting device screen dimensions")
                     try {
-                        call.respondText("{\"x\": ${screenWidth}, \"y\": ${screenHeight}}")
+                        call.respond(HttpStatusCode.OK, ScreenSizeResponse(screenWidth, screenHeight))
                     } catch (e: Exception) {
-                        println("Get screen error: ${e.message}")
-                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                        Log.e(logTag, "Internal error getting device screen dimensions: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed getting device screen dimensions - ${e.message}"))
                     }
                 }
 
-
                 post("/clipboard") {
                     try {
-                        // 1. remember current IME
+                        Log.d(logTag, "Getting current device IME")
                         val curIme = exec(("settings get secure default_input_method").trim())
 
-                        // 2. switch to RemoteIme (enable if necessary)
+                        Log.d(logTag, "Enabling GADS IME")
                         exec("ime enable com.gads.settings/.GADSKeyboardIME")
+                        Log.d(logTag, "Setting GADS IME as default")
                         exec("ime set com.gads.settings/.GADSKeyboardIME")
 
                         // 3. synchronous ordered broadcast: resultData holds Base64 text
+                        Log.d(logTag, "Sending broadcast to GADS IME to get clipboard data")
                         val res = exec(
                             "am broadcast -n com.gads.settings/.ClipboardReceiver -a com.gads.settings.CLIPBOARD_GET"
                         )
                         val b64 = Regex("""Broadcast completed: result=.*?data="(.*?)"""")
                             .find(res)?.groupValues?.get(1) ?: ""
-                        val text = String(Base64.decode(b64, Base64.NO_WRAP))
 
-                        // 4. restore user IME
+                        Log.d(logTag, "Restoring previous device IME")
                         exec("ime set $curIme")
 
-                        call.respond(HttpStatusCode.OK, "{\"value\": \"${b64}\"}")
+                        call.respond(HttpStatusCode.OK, ClipboardResponse(b64))
                     } catch (e: Exception) {
-                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                        Log.e(logTag, "Internal error getting device clipboard: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed getting device clipboard - ${e.message}"))
                     }
                 }
 
                 post("/home") {
                     try {
                         inputInjector.pressHome()
-                        call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                        call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully navigated to device Home"))
                     } catch (e: Exception) {
-                        println("Home error: ${e.message}")
-                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                        Log.e(logTag, "Internal error navigating to Home: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed navigating to device Home - ${e.message}"))
                     }
                 }
 
                 post("/lock") {
                     try {
+                        Log.d(logTag, "Attempting to lock device by pressing the power button")
                         inputInjector.pressPower()
-                        call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                        call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully locked device"))
                     } catch (e: Exception) {
-                        println("Lock error: ${e.message}")
-                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                        Log.e(logTag, "Internal error locking device: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed locking device - ${e.message}"))
                     }
                 }
 
                 post("/unlock") {
                     try {
+                        Log.d(logTag, "Attempting to unlock device")
+                        Log.d(logTag, "Pressing power button on device")
                         inputInjector.pressPower()
-                        call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                        delay(1000)
+                        val xCoordinate = screenWidth / 2
+                        val yCoordinate1 = screenHeight - (screenHeight * 0.9)
+                        val yCoordinate2 = screenHeight - (screenHeight * 0.1)
+                        Log.d(logTag, "Swiping from `$xCoordinate:$yCoordinate1` to `$xCoordinate:$yCoordinate2`")
+                        inputInjector.swipeAsync(
+                            xCoordinate.toFloat(),
+                            yCoordinate1.toFloat(),
+                            xCoordinate.toFloat(),
+                            yCoordinate2.toFloat(),
+                            1000
+                        )
+                        call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully unlocked device"))
                     } catch (e: Exception) {
-                        println("Unlock error: ${e.message}")
-                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                        Log.e(logTag, "Internal error unlocking device: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed unlocking device - ${e.message}"))
                     }
                 }
 
                 post("/appSwitch") {
                     try {
+                        Log.d(logTag, "Opening app switcher")
                         inputInjector.openAppSwitch()
-                        call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                        call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully opened app switcher"))
                     } catch (e: Exception) {
-                        println("Home error: ${e.message}")
-                        call.respond(HttpStatusCode.BadRequest, "{\"status\": \"error\", \"message\": \"Invalid request\"}")
+                        Log.e(logTag, "Internal error opening app switcher: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed opening app switcher - ${e.message}"))
                     }
                 }
 
                 get("/ping") {
-                    call.respondText("{\"status\": \"pong\"}", ContentType.Application.Json)
+                    call.respond(HttpStatusCode.OK)
                 }
             }
         }.start(wait = true)
@@ -215,7 +284,7 @@ class RemoteControlServer(private val port: Int) {
 
         val width = dm.widthPixels
         val height = dm.heightPixels
-        println("Screen size via DisplayManagerGlobal: ${width}x${height}")
+        Log.i(logTag, "Got screen size via DisplayManagerGlobal: $width:$height")
         return width to height
     }
 }
@@ -223,6 +292,7 @@ class RemoteControlServer(private val port: Int) {
 @SuppressLint("DiscouragedPrivateApi", "PrivateApi")
 class InputInjector {
     // Instance of InputManager **or** InputManagerGlobal (depends on API level)
+    private var logTag = "GADS Remote"
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val inputManagerObj: Any
     private val injectInputEventMethod: Method
@@ -246,9 +316,10 @@ class InputInjector {
                 Int::class.javaPrimitiveType
             )
             ok = true
-            println("InputInjector: using InputManagerGlobal API")
+            Log.i(logTag, "InputInjector: using InputManagerGlobal API")
         } catch (_: ClassNotFoundException) {
             /* Device is ≤ Android 13 – fall through */
+            Log.w(logTag, "InputInjector: failed using InputManagerGlobal API, attempting fallback to legacy InputManager API")
         }
 
         // 2️⃣  Fallback for Android 13 and older
@@ -262,7 +333,7 @@ class InputInjector {
                 InputEvent::class.java,
                 Int::class.javaPrimitiveType
             )
-            println("InputInjector: using legacy InputManager API")
+            Log.i(logTag, "InputInjector: using legacy InputManager API")
         }
 
         inputManagerObj = imObj ?: error("Unable to obtain InputManager")
@@ -271,15 +342,27 @@ class InputInjector {
 
         // Key events still go through the same method signature
         injectKeyEventMethod = injectInputEventMethod
-        println("InputInjector initialized")
+        Log.i(logTag, "InputInjector initialized")
     }
 
+    /**
+     * Inject events like tap, swipe, etc
+     * @param event the event we want to perform either InputEvent or MotionEvent
+     */
     private fun injectEvent(event: InputEvent): Boolean =
         injectInputEventMethod.invoke(inputManagerObj, event, 0) as Boolean
 
+    /**
+     * Inject key events like Home, Power, etc
+     * @param event the key event we want to perform
+     */
     private fun injectKey(event: KeyEvent): Boolean =
         injectKeyEventMethod.invoke(inputManagerObj, event, 0) as Boolean
 
+    /**
+     * Inject key codes as events like Home, Power, etc
+     * @param keyCode the representation for the keycode we want to inject as event, e.g. KeyEvent.KEYCODE_HOME
+     */
     private fun injectKeyCode(keyCode: Int) {
         val downTime = SystemClock.uptimeMillis()
         val eventTime = downTime + 10
@@ -291,26 +374,37 @@ class InputInjector {
         injectKey(upEvent)
     }
 
+    /**
+     * Simulate pressing Home button
+     */
     fun pressHome() {
         injectKeyCode(KeyEvent.KEYCODE_HOME)
-        println("Pressing Home")
     }
 
+    /**
+     * Simulate pressing Power button
+     */
     fun pressPower() {
         injectKeyCode(KeyEvent.KEYCODE_POWER)
-        println("Pressing power")
     }
 
+    /**
+     * Simulate pressing app switcher button
+     */
     fun openAppSwitch() {
         injectKeyCode(KeyEvent.KEYCODE_APP_SWITCH)
-        println("Opening app switch")
     }
 
+    /**
+     * Simulate pressing Back button
+     */
     fun pressBack() {
         injectKeyCode(KeyEvent.KEYCODE_BACK)
-        println("PRessing back")
     }
 
+    /**
+     * Inject tap event at coordinates
+     */
     fun tap(x: Float, y: Float) {
         val time = SystemClock.uptimeMillis()
 
@@ -327,16 +421,20 @@ class InputInjector {
 
         down.recycle()
         up.recycle()
-
-        println("Tap at ($x, $y)")
     }
 
+    /**
+     * Inject touch&hold event at coordinates
+     */
     fun touchAndHoldAsync(
         x: Float, y: Float, duration: Long
     ) {
         scope.launch { touchAndHold(x, y, duration) }
     }
 
+    /**
+     * Inject touch&hold event at coordinates
+     */
     suspend fun touchAndHold(x: Float, y: Float, duration: Long) {
         val time = SystemClock.uptimeMillis()
 
@@ -355,10 +453,11 @@ class InputInjector {
 
         down.recycle()
         up.recycle()
-
-        println("Touch and hold at ($x, $y) for duration $duration")
     }
 
+    /**
+     * Inject swipe event at coordinates
+     */
     fun swipeAsync(
         x1: Float, y1: Float, x2: Float, y2: Float,
         duration: Int = 300
@@ -366,6 +465,9 @@ class InputInjector {
         scope.launch { swipe(x1, y1, x2, y2, duration) }
     }
 
+    /**
+     * Inject swipe event at coordinates
+     */
     fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, duration: Int) {
         val startTime = SystemClock.uptimeMillis()
 
@@ -406,51 +508,33 @@ class InputInjector {
 
         down.recycle()
         up.recycle()
-
-        println("Swipe from ($x1, $y1) to ($x2, $y2) over ${duration}ms")
     }
-}
-
-@SuppressLint("PrivateApi", "DiscouragedPrivateApi")
-object ClipboardHelper {
-
-    private val context by lazy {
-        // Works from a plain app_process entry-point
-        val at = Class.forName("android.app.ActivityThread")
-        val curApp = at.getDeclaredMethod("currentApplication")
-        curApp.invoke(null) as android.content.Context?
-            ?: error("No Context available")
-    }
-
-    /**
-     * @return current primary-clip text or null if empty/non-text
-     */
-    fun getText(): String? = runCatching {
-        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                as android.content.ClipboardManager
-        cm.primaryClip
-            ?.takeIf { it.itemCount > 0 }
-            ?.getItemAt(0)
-            ?.coerceToText(context)
-            ?.toString()
-    }.getOrNull()
 }
 
 fun main(args: Array<String>) {
-    println("Starting Remote Control Server...")
-
+    val logTag = "GADS Remote"
     val port = args.getOrNull(0)?.toIntOrNull() ?: 1994
+    val jsonFormatter = Json { prettyPrint = false }
 
     try {
         val server = RemoteControlServer(port)
-        println("Server starting on port $port")
-        println("Endpoints:")
-        println("  POST /tap - {\"x\": 100, \"y\": 200}")
-        println("  POST /swipe - {\"x1\": 100, \"y1\": 200, \"x2\": 300, \"y2\": 400, \"duration\": 500}")
+        Log.i(logTag, "Starting GADS remote control server on port `$port`...")
+        Log.i(logTag, "Endpoints:")
+        Log.i(logTag, "POST /tap ${jsonFormatter.encodeToString(TapRequest.serializer(), TapRequest(x = 100f, y = 200f))}")
+        Log.i(logTag, "POST /swipe ${jsonFormatter.encodeToString(SwipeRequest.serializer(), SwipeRequest(x1 = 100f, y1 = 200f, x2 = 100f, y2 = 200f, duration = 1000))}")
+        Log.i(logTag, "POST /touchAndHold ${jsonFormatter.encodeToString(TouchAndHoldRequest.serializer(), TouchAndHoldRequest(x = 100f, y = 200f, duration = 1000))}")
+        Log.i(logTag, "GET /screen-size")
+        Log.i(logTag, "POST /clipboard")
+        Log.i(logTag, "POST /home")
+        Log.i(logTag, "POST /back")
+        Log.i(logTag, "POST /lock")
+        Log.i(logTag, "POST /unlock")
+        Log.i(logTag, "POST /appSwitch")
+        Log.i(logTag, "POST /ping")
 
         server.start()
     } catch (e: Exception) {
-        println("Failed to start server: ${e.message}")
+        Log.e(logTag, "Failed to start GADS remote control server - ${e.message}")
         e.printStackTrace()
     }
 }

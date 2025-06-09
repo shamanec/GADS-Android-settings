@@ -11,6 +11,7 @@ class WebRTCWebsocketServer(port: Int, private val webRTCScreenCaptureService: W
     WebSocketServer(
         InetSocketAddress(port)
     ) {
+    private val TAG = "GADS WebRTC server"
     private val clients = mutableSetOf<WebSocket>()
 
     fun sendMessage(message: String) {
@@ -30,17 +31,17 @@ class WebRTCWebsocketServer(port: Int, private val webRTCScreenCaptureService: W
     }
 
     override fun onMessage(conn: WebSocket, message: String) {
-        Log.d("WEBSOCKET1", message)
+        Log.d(TAG, "Received message - $message")
         if (message.contains("offer")) {
-            Log.d("WEBSOCKET1", "handling offer")
+            Log.d(TAG, "Message was WebRTC offer, handling offer")
             webRTCScreenCaptureService.setReceivedOffer(message)
         }
         if (message.contains("\"candidate\"")) {
-            Log.d("WEBSOCKET1", "handling ice")
+            Log.d(TAG, "Message was WebRTC ICE candidate, handling candidate")
             webRTCScreenCaptureService.handleIce(message)
         }
-        if (message.equals("hangup")) {
-            Log.d("WEBSOCKET1", "client hung up")
+        if (message == "hangup") {
+            Log.d(TAG, "Messages was hangup, handling hangup")
             webRTCScreenCaptureService.handleHangup()
         }
     }
