@@ -13,7 +13,7 @@
         android:layout_height="wrap_content"
         android:background="#333333"
         android:padding="4dp"
-        android:text="Remote: Active"
+        android:text="GADS Remote: Active"
         android:textColor="#4CAF50"
         android:minWidth="200dp"
         android:textSize="12sp"
