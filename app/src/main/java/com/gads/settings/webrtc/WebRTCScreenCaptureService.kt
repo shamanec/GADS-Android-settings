@@ -247,7 +247,7 @@ class WebRTCScreenCaptureService : Service() {
                 parameters.encodings?.forEach { encoding ->
                     encoding.maxBitrateBps = 1_000_000
                     encoding.minBitrateBps = 5_000_000
-                    encoding.maxFramerate = 60
+                    encoding.maxFramerate = 30
 
                     // Enable scalability for better adaptation
                     encoding.scalabilityMode = "L1T1" // 3 temporal, 3 spatial layers
@@ -301,7 +301,7 @@ class WebRTCScreenCaptureService : Service() {
                 // Bitrate settings
                 minBitrateBps = 1_000_000
                 maxBitrateBps = 5_000_000
-                maxFramerate = 60
+                maxFramerate = 30
                 // No resolution scaling for screen share
                 scaleResolutionDownBy = 1.0
 
@@ -377,12 +377,12 @@ class WebRTCScreenCaptureService : Service() {
         windowManager.defaultDisplay.getRealMetrics(metrics)
 
         Thread.sleep(500)
-        streamWidth = metrics.widthPixels / 3
-        streamHeight = metrics.heightPixels / 3
+        streamWidth = metrics.widthPixels / 2
+        streamHeight = metrics.heightPixels / 2
         // Now restart capturing with the new resolution
         try {
             Log.d(TAG, "updateCaptureResolution: Restarting capture at ${streamWidth}x${streamHeight}")
-            screenCapturer.startCapture(streamWidth, streamHeight, 60)
+            screenCapturer.startCapture(streamWidth, streamHeight, 30)
         } catch (e: Exception) {
             Log.e(TAG, "updateCaptureResolution: Error restarting capture: ${e.message}")
         }
@@ -454,8 +454,8 @@ class WebRTCScreenCaptureService : Service() {
         val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         val mDisplay = windowManager.defaultDisplay
         mDisplay.getRealMetrics(metrics)
-        streamWidth = metrics.widthPixels / 3
-        streamHeight = metrics.heightPixels / 3
+        streamWidth = metrics.widthPixels / 2
+        streamHeight = metrics.heightPixels / 2
 
         screenCapturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() {
             override fun onStop() {
@@ -467,11 +467,11 @@ class WebRTCScreenCaptureService : Service() {
             adaptOutputFormat(
                 streamWidth,
                 streamHeight,
-                60
+                30
             )
             screenCapturer.initialize(surfaceTextureHelper, this@WebRTCScreenCaptureService, capturerObserver)
             try {
-                screenCapturer.startCapture(streamWidth, streamHeight, 60)
+                screenCapturer.startCapture(streamWidth, streamHeight, 30)
             } catch (e: Exception) {
                 Log.e(TAG, "startProjection: ScreenCapturer failed to start: ${e.message}")
             }
