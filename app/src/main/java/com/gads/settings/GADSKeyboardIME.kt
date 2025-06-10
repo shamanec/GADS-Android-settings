@@ -10,6 +10,8 @@ import android.util.Log
 import android.view.KeyEvent
 import android.view.View
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.cio.CIO
@@ -120,6 +122,20 @@ class GADSKeyboardIME : InputMethodService(), KeyboardView.OnKeyboardActionListe
             keyboard = if (isSymbolsKeyboard) this@GADSKeyboardIME.symbolsKeyboard else this@GADSKeyboardIME.keyboard
             setOnKeyboardActionListener(this@GADSKeyboardIME)
             isPreviewEnabled = false // Disable key previews
+        }
+
+        ViewCompat.setOnApplyWindowInsetsListener(inflatedView) { view, insets ->
+            val systemBarsInsets = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+
+            // Apply bottom padding to avoid overlap with system bars (like the gesture bar)
+            view.setPadding(
+                view.paddingLeft,
+                view.paddingTop,
+                view.paddingRight,
+                systemBarsInsets.bottom
+            )
+
+            insets
         }
 
         return inflatedView
