@@ -2,6 +2,7 @@ package com.gads.settings
 
 import android.annotation.SuppressLint
 import android.os.Build
+import android.os.Environment
 import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
@@ -25,6 +26,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.lang.reflect.Method
 import java.util.concurrent.TimeUnit
@@ -78,6 +80,15 @@ data class ScreenSizeResponse(val x: Int, val y: Int)
 @Serializable
 data class ClipboardResponse(val value: String)
 
+@Serializable
+data class AndroidFileNode(
+    val name: String,
+    val isFile: Boolean = false,
+    val fullPath: String,
+    val fileDate: Long? = null,
+    val children: Map<String, AndroidFileNode>? = null
+)
+
 /**
  * The ktor server accepting the requests for the remote control and data acquisition
  */
@@ -95,7 +106,8 @@ class RemoteControlServer(private val port: Int) {
 
         val jsonFormatter = Json {
             prettyPrint = false
-            ignoreUnknownKeys = true // skip unknown keys from incoming requests
+            ignoreUnknownKeys = true // skip unknown keys from incoming requests,
+            encodeDefaults = true
         }
 
         embeddedServer(CIO, port = port) {
@@ -262,6 +274,18 @@ class RemoteControlServer(private val port: Int) {
                     }
                 }
 
+                get("/files") {
+                    val filesNode: AndroidFileNode
+                    try {
+                        Log.d(logTag, "Getting shared storage files")
+                        filesNode = getFiles()
+                        call.respond(HttpStatusCode.OK, filesNode)
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Internal error getting shared storage files: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed getting shared storage files - ${e.message}"))
+                    }
+                }
+
                 get("/ping") {
                     call.respond(HttpStatusCode.OK)
                 }
@@ -286,6 +310,50 @@ class RemoteControlServer(private val port: Int) {
         val height = dm.heightPixels
         Log.i(logTag, "Got screen size via DisplayManagerGlobal: $width:$height")
         return width to height
+    }
+
+    private fun getFiles(): AndroidFileNode {
+        val root = Environment.getExternalStorageDirectory() // /sdcard
+        val topLevelFolders = listOf("DCIM", "Pictures", "Download", "Documents", "Movies", "Music")
+
+        val filteredChildren = root.listFiles()
+            ?.filter { it.isDirectory && it.name in topLevelFolders }
+            ?.associate { it.name to buildTree(it) }
+            ?: emptyMap()
+
+        return AndroidFileNode(
+            name = root.name,
+            fullPath = root.absolutePath,
+            children = filteredChildren
+        )
+    }
+
+    private fun buildTree(current: File): AndroidFileNode {
+        val excludedFolders = setOf(".thumbnails", ".nomedia", "cache", "tmp")
+        if (current.isFile) {
+            return AndroidFileNode(
+                name = current.name,
+                fullPath = current.absolutePath,
+                isFile = true,
+                fileDate = current.lastModified()
+            )
+        }
+
+        val childrenMap = current.listFiles()
+            ?.filter { file ->
+                val name = file.name
+                name !in excludedFolders && !name.startsWith(".") // Exclude by name and hidden folders
+            }
+            ?.sortedBy { it.name }
+            ?.associate { it.name to buildTree(it) }
+            ?: emptyMap()
+
+        return AndroidFileNode(
+            name = current.name,
+            fullPath = current.absolutePath,
+            isFile = false,
+            children = childrenMap
+        )
     }
 }
 
