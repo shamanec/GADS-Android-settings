@@ -315,6 +315,16 @@ class RemoteControlServer(private val port: Int) {
                     }
                 }
 
+                get("/screenshot-lq") {
+                    Log.d(logTag, "Taking screenshot")
+                    val screenshot = takeScreenshot(useJpeg = true, scale = 3)
+                    if (screenshot != null) {
+                        call.respond(HttpStatusCode.OK, ScreenshotResponse(screenshot))
+                    } else {
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed to take screenshot - functionality not available or capture failed"))
+                    }
+                }
+
                 get("/screenshot") {
                     Log.d(logTag, "Taking screenshot")
                     val screenshot = takeScreenshot(useJpeg = true)
@@ -361,7 +371,7 @@ class RemoteControlServer(private val port: Int) {
         return width to height
     }
 
-    private fun takeScreenshot(useJpeg: Boolean = true): String? {
+    private fun takeScreenshot(useJpeg: Boolean = true, scale: Int = 2): String? {
         if (screenshotMethod == null) {
             Log.e(logTag, "Screenshot functionality not available - SurfaceControl initialization failed")
             return null
@@ -369,8 +379,8 @@ class RemoteControlServer(private val port: Int) {
         
         return try {
             // Capture at half resolution directly to avoid scaling step
-            val scaledWidth = screenWidth / 2
-            val scaledHeight = screenHeight / 2
+            val scaledWidth = screenWidth / scale
+            val scaledHeight = screenHeight / scale
             val rect = android.graphics.Rect(0, 0, screenWidth, screenHeight)
             
             val bitmap = screenshotMethod.invoke(null, rect, scaledWidth, scaledHeight, 0) as Bitmap
