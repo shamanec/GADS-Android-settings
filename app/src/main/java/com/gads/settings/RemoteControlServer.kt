@@ -26,10 +26,13 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStreamReader
 import java.lang.reflect.Method
 import java.util.concurrent.TimeUnit
+import android.graphics.Bitmap
+import android.util.Base64
 
 /**
  * Function for executing shell commands on the device
@@ -89,6 +92,9 @@ data class AndroidFileNode(
     val children: Map<String, AndroidFileNode>? = null
 )
 
+@Serializable
+data class ScreenshotResponse(val screenshot: String)
+
 /**
  * The ktor server accepting the requests for the remote control and data acquisition
  */
@@ -97,6 +103,29 @@ class RemoteControlServer(private val port: Int) {
     private var screenWidth: Int = 0
     private var screenHeight: Int = 0
     private var logTag = "GADS Remote"
+    
+    // Cached reflection objects for SurfaceControl screenshot
+    private val screenshotMethod: Method?
+
+    init {
+        // Initialize SurfaceControl reflection
+        var method: Method? = null
+        try {
+            val surfaceClass = Class.forName("android.view.SurfaceControl")
+            method = surfaceClass.getDeclaredMethod(
+                "screenshot", 
+                android.graphics.Rect::class.java, 
+                Int::class.javaPrimitiveType, 
+                Int::class.javaPrimitiveType, 
+                Int::class.javaPrimitiveType
+            )
+            method.isAccessible = true
+            Log.i(logTag, "SurfaceControl screenshot method initialized")
+        } catch (e: Exception) {
+            Log.e(logTag, "Failed to initialize SurfaceControl screenshot: ${e.message}")
+        }
+        screenshotMethod = method
+    }
 
     @SuppressLint("NewApi")
     fun start() {
@@ -286,6 +315,36 @@ class RemoteControlServer(private val port: Int) {
                     }
                 }
 
+                get("/screenshot-lq") {
+                    Log.d(logTag, "Taking screenshot")
+                    val screenshot = takeScreenshot(useJpeg = true, scale = 3)
+                    if (screenshot != null) {
+                        call.respond(HttpStatusCode.OK, ScreenshotResponse(screenshot))
+                    } else {
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed to take screenshot - functionality not available or capture failed"))
+                    }
+                }
+
+                get("/screenshot") {
+                    Log.d(logTag, "Taking screenshot")
+                    val screenshot = takeScreenshot(useJpeg = true)
+                    if (screenshot != null) {
+                        call.respond(HttpStatusCode.OK, ScreenshotResponse(screenshot))
+                    } else {
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed to take screenshot - functionality not available or capture failed"))
+                    }
+                }
+
+                get("/screenshot-hq") {
+                    Log.d(logTag, "Taking high-quality screenshot")
+                    val screenshot = takeScreenshot(useJpeg = false)
+                    if (screenshot != null) {
+                        call.respond(HttpStatusCode.OK, ScreenshotResponse(screenshot))
+                    } else {
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed to take screenshot - functionality not available or capture failed"))
+                    }
+                }
+
                 get("/ping") {
                     call.respond(HttpStatusCode.OK)
                 }
@@ -310,6 +369,54 @@ class RemoteControlServer(private val port: Int) {
         val height = dm.heightPixels
         Log.i(logTag, "Got screen size via DisplayManagerGlobal: $width:$height")
         return width to height
+    }
+
+    private fun takeScreenshot(useJpeg: Boolean = true, scale: Int = 2): String? {
+        if (screenshotMethod == null) {
+            Log.e(logTag, "Screenshot functionality not available - SurfaceControl initialization failed")
+            return null
+        }
+        
+        return try {
+            // Capture at half resolution directly to avoid scaling step
+            val scaledWidth = screenWidth / scale
+            val scaledHeight = screenHeight / scale
+            val rect = android.graphics.Rect(0, 0, screenWidth, screenHeight)
+            
+            val bitmap = screenshotMethod.invoke(null, rect, scaledWidth, scaledHeight, 0) as Bitmap
+            
+            val imageBytes = if (useJpeg) {
+                bitmapToJpegBytes(bitmap)
+            } else {
+                bitmapToPngBytes(bitmap)
+            }
+            
+            val base64String = Base64.encodeToString(imageBytes, Base64.NO_WRAP)
+            
+            bitmap.recycle()
+            base64String
+        } catch (e: Exception) {
+            Log.e(logTag, "Failed to take screenshot: ${e.message}")
+            null
+        }
+    }
+
+    private fun bitmapToJpegBytes(bitmap: Bitmap, quality: Int = 70): ByteArray {
+        val outputStream = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, quality, outputStream)
+        return outputStream.toByteArray()
+    }
+
+    private fun bitmapToPngBytes(bitmap: Bitmap): ByteArray {
+        val outputStream = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
+        return outputStream.toByteArray()
+    }
+
+    private fun scaleDown(bitmap: Bitmap, scaleFactor: Int): Bitmap {
+        val newWidth = bitmap.width / scaleFactor
+        val newHeight = bitmap.height / scaleFactor
+        return Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
     }
 
     private fun getFiles(): AndroidFileNode {
@@ -598,7 +705,10 @@ fun main(args: Array<String>) {
         Log.i(logTag, "POST /lock")
         Log.i(logTag, "POST /unlock")
         Log.i(logTag, "POST /appSwitch")
-        Log.i(logTag, "POST /ping")
+        Log.i(logTag, "GET /screenshot")
+        Log.i(logTag, "GET /screenshot-hq")
+        Log.i(logTag, "GET /files")
+        Log.i(logTag, "GET /ping")
 
         server.start()
     } catch (e: Exception) {
