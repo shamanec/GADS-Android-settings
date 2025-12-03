@@ -11,7 +11,7 @@ class WebRTCWebsocketServer(port: Int, private val webRTCScreenCaptureService: W
     WebSocketServer(
         InetSocketAddress(port)
     ) {
-    private val TAG = "GADS WebRTC server"
+    private val TAG = "GADS-Conn"
     private val clients = mutableSetOf<WebSocket>()
 
     fun sendMessage(message: String) {

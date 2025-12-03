@@ -44,7 +44,8 @@ class StreamPeerConnection(
   private val onStreamAdded: ((MediaStream) -> Unit)?,
   private val onNegotiationNeeded: ((StreamPeerConnection, StreamPeerType) -> Unit)?,
   private val onIceCandidate: ((IceCandidate, StreamPeerType) -> Unit)?,
-  private val onVideoTrack: ((RtpTransceiver?) -> Unit)?
+  private val onVideoTrack: ((RtpTransceiver?) -> Unit)?,
+  private val onIceConnectionChange: ((PeerConnection.IceConnectionState) -> Unit)?
 ) : PeerConnection.Observer {
 
   private val typeTag = type.stringify()
@@ -243,6 +244,7 @@ class StreamPeerConnection(
    */
   override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
     Log.d(TAG, "[onIceConnectionChange] #sfu; #$typeTag; newState: $newState")
+    newState?.let { onIceConnectionChange?.invoke(it) }
     when (newState) {
       PeerConnection.IceConnectionState.CLOSED,
       PeerConnection.IceConnectionState.FAILED,
