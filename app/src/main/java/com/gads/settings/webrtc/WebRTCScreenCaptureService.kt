@@ -90,6 +90,10 @@ class WebRTCScreenCaptureService : Service() {
     private var isCaptureRunning = false
     private val captureMutex = Mutex()
 
+    // Android 14+: Flag to indicate projection was invalidated and needs re-authorization
+    @Volatile
+    private var projectionNeedsReauthorization = false
+
     // FPS constant
     private val TARGET_FPS = 30
 
@@ -200,6 +204,9 @@ class WebRTCScreenCaptureService : Service() {
         val data = intent.getParcelableExtra<Intent>("DATA")
         projectionIntent = data
 
+        // Reset re-authorization flag when we receive a new Intent
+        projectionNeedsReauthorization = false
+
         // Start the foreground service
         if (isStartCommand(intent)) {
             // Create notification
@@ -208,6 +215,14 @@ class WebRTCScreenCaptureService : Service() {
             )
             startForeground(notification.first, notification.second)
             logBuffer("Foreground service started")
+
+            // Android 14+: Start capture immediately (Intent is one-time-use)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                if (!isCaptureRunning && projectionIntent != null) {
+                    logBuffer("Android 14+: Starting capture immediately")
+                    startProjection(projectionIntent)
+                }
+            }
         }
 
         return START_NOT_STICKY
@@ -217,6 +232,16 @@ class WebRTCScreenCaptureService : Service() {
         super.onDestroy()
         // Disable the orientation listener to prevent leaks
         orientationEventListener?.disable()
+
+        // Cleanup capture when service is destroyed
+        if (isCaptureRunning) {
+            try {
+                screenCapturer.stopCapture()
+            } catch (e: Exception) {
+                Log.e(TAG_BUFFER, "Failed to stop screen capture on destroy: ${e.message}")
+            }
+            isCaptureRunning = false
+        }
     }
 
     fun setReceivedOffer(offerMsg: String) {
@@ -230,7 +255,21 @@ class WebRTCScreenCaptureService : Service() {
         // Start the projection if we currently don't have a peerConnection
         // This is needed because we close the peer connection on disconnect of the client
         if (peerConnection == null) {
-            startProjection(projectionIntent)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                // Android 14+: Capture should already be running (started in onStartCommand)
+                if (!isCaptureRunning) {
+                    if (projectionNeedsReauthorization) {
+                        logBuffer("Projection invalidated, triggering re-authorization")
+                        triggerReauthorization()
+                        return
+                    }
+                    Log.e(TAG_BUFFER, "Cannot handle offer - capture not running on Android 14+")
+                    return
+                }
+            } else {
+                // Android 13-: Original behavior
+                startProjection(projectionIntent)
+            }
         }
 
         runBlocking {
@@ -568,15 +607,19 @@ class WebRTCScreenCaptureService : Service() {
             peerConnection = null
         }
 
-        // Stop capture completely
-        try {
-            screenCapturer.stopCapture()
-        } catch (e: Exception) {
-            Log.e(TAG_BUFFER, "Failed to stop screen capture: ${e.message}")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // Android 14+: Keep capture running (Intent is one-time-use)
+            logConn("Connection closed, keeping capture running for reconnection (Android 14+)")
+        } else {
+            // Android 13-: Original behavior - stop capture completely
+            try {
+                screenCapturer.stopCapture()
+            } catch (e: Exception) {
+                Log.e(TAG_BUFFER, "Failed to stop screen capture: ${e.message}")
+            }
+            isCaptureRunning = false
+            logConn("Connection closed, capture stopped")
         }
-        isCaptureRunning = false
-
-        logConn("Connection closed, capture stopped")
     }
 
     /**
@@ -605,6 +648,12 @@ class WebRTCScreenCaptureService : Service() {
             override fun onStop() {
                 logBuffer("MediaProjection stopped")
                 isCaptureRunning = false
+
+                // Android 14+: Mark that we need re-authorization
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    projectionNeedsReauthorization = true
+                    logBuffer("Projection invalidated, will request re-authorization on next client connection")
+                }
             }
         })
 
@@ -668,6 +717,20 @@ class WebRTCScreenCaptureService : Service() {
         sessionManagerScope.launch {
             _localVideoTrackFlow.emit(localVideoTrack)
         }
+    }
+
+    /**
+     * Trigger re-authorization by launching the permission activity.
+     * Called when projection was invalidated (Android 14+) and client tries to connect.
+     * The appops PROJECT_MEDIA permission set by the backend will skip the user dialog.
+     */
+    private fun triggerReauthorization() {
+        logBuffer("Launching WebRTCScreenCaptureActivity for re-authorization")
+
+        val intent = Intent(this, WebRTCScreenCaptureActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
     }
 
 }
