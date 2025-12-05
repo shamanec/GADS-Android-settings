@@ -5,6 +5,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjection
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -24,21 +25,27 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
+import org.webrtc.PeerConnection
 import org.webrtc.MediaStreamTrack
 import org.webrtc.RtpParameters
 import org.webrtc.RtpTransceiver
+import org.webrtc.CapturerObserver
 import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoSource
+import org.webrtc.VideoFrame
 import org.webrtc.VideoTrack
 import java.util.UUID
 
 class WebRTCScreenCaptureService : Service() {
-    private val TAG = "GADS WebRTC"
+    private val TAG_BUFFER = "GADS-Buffer"
+    private val TAG_CONN = "GADS-Conn"
     // Socket server
     private var server: WebRTCWebsocketServer = WebRTCWebsocketServer(1991, this)
 
@@ -66,6 +73,40 @@ class WebRTCScreenCaptureService : Service() {
     private lateinit var videoSource: VideoSource
     private lateinit var localVideoTrack: VideoTrack
     private val _localVideoTrackFlow = MutableSharedFlow<VideoTrack>()
+
+    // First frame detection
+    @Volatile
+    private var firstFrameCaptured = false
+    private var pendingForceFrame = false
+
+    // Streaming state
+    @Volatile
+    private var isIceConnected = false
+    @Volatile
+    private var firstFrameSentAfterConnect = false
+
+    // Capture state
+    @Volatile
+    private var isCaptureRunning = false
+    private val captureMutex = Mutex()
+
+    // Android 14+: Flag to indicate projection was invalidated and needs re-authorization
+    @Volatile
+    private var projectionNeedsReauthorization = false
+
+    // FPS constant
+    private val TARGET_FPS = 30
+
+    // Debug timing
+    private var serviceStartTime = 0L
+    private fun logBuffer(event: String) {
+        val elapsed = if (serviceStartTime > 0) System.currentTimeMillis() - serviceStartTime else 0
+        Log.d(TAG_BUFFER, "[${elapsed}ms] $event")
+    }
+    private fun logConn(event: String) {
+        val elapsed = if (serviceStartTime > 0) System.currentTimeMillis() - serviceStartTime else 0
+        Log.d(TAG_CONN, "[${elapsed}ms] $event")
+    }
     private var surfaceTextureHelper = SurfaceTextureHelper.create(
         "SurfaceTextureHelperThread",
         peerConnectionFactory.eglBaseContext
@@ -142,7 +183,7 @@ class WebRTCScreenCaptureService : Service() {
                 val rotation = wm.defaultDisplay.rotation
 
                 if (rotation != lastKnownRotation) {
-                    Log.d(TAG, "OrientationEventListener: Orientation changed from `$lastKnownRotation` to `$rotation`")
+                    Log.d(TAG_BUFFER, "Orientation changed: $lastKnownRotation -> $rotation")
                     lastKnownRotation = rotation
                     updateCaptureResolution()
                 }
@@ -155,9 +196,16 @@ class WebRTCScreenCaptureService : Service() {
 
     // The onStartCommand() method is called by the Android system when the service is started
     override fun onStartCommand(intent: Intent, flags: Int, startId: Int): Int {
+        // Reset timing for debug
+        serviceStartTime = System.currentTimeMillis()
+        logBuffer("Service starting")
+
         // Keep the intent for multiple projection start ups
         val data = intent.getParcelableExtra<Intent>("DATA")
         projectionIntent = data
+
+        // Reset re-authorization flag when we receive a new Intent
+        projectionNeedsReauthorization = false
 
         // Start the foreground service
         if (isStartCommand(intent)) {
@@ -166,6 +214,15 @@ class WebRTCScreenCaptureService : Service() {
                 this
             )
             startForeground(notification.first, notification.second)
+            logBuffer("Foreground service started")
+
+            // Android 14+: Start capture immediately (Intent is one-time-use)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                if (!isCaptureRunning && projectionIntent != null) {
+                    logBuffer("Android 14+: Starting capture immediately")
+                    startProjection(projectionIntent)
+                }
+            }
         }
 
         return START_NOT_STICKY
@@ -175,10 +232,21 @@ class WebRTCScreenCaptureService : Service() {
         super.onDestroy()
         // Disable the orientation listener to prevent leaks
         orientationEventListener?.disable()
+
+        // Cleanup capture when service is destroyed
+        if (isCaptureRunning) {
+            try {
+                screenCapturer.stopCapture()
+            } catch (e: Exception) {
+                Log.e(TAG_BUFFER, "Failed to stop screen capture on destroy: ${e.message}")
+            }
+            isCaptureRunning = false
+        }
     }
 
     fun setReceivedOffer(offerMsg: String) {
-        Log.d(TAG, "setReceivedOffer: Received offer - $offerMsg")
+        logConn("Offer received")
+
         // Parse the offer SDP from the received message from the React UI client
         val offerJson = JSONObject(offerMsg)
         val sdp = offerJson.getString("sdp")
@@ -187,13 +255,28 @@ class WebRTCScreenCaptureService : Service() {
         // Start the projection if we currently don't have a peerConnection
         // This is needed because we close the peer connection on disconnect of the client
         if (peerConnection == null) {
-            startProjection(projectionIntent)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                // Android 14+: Capture should already be running (started in onStartCommand)
+                if (!isCaptureRunning) {
+                    if (projectionNeedsReauthorization) {
+                        logBuffer("Projection invalidated, triggering re-authorization")
+                        triggerReauthorization()
+                        return
+                    }
+                    Log.e(TAG_BUFFER, "Cannot handle offer - capture not running on Android 14+")
+                    return
+                }
+            } else {
+                // Android 13-: Original behavior
+                startProjection(projectionIntent)
+            }
         }
 
         runBlocking {
             peerConnection?.connection?.close()
             peerConnection = null
 
+            logConn("Creating PeerConnection...")
             // Create a StreamPeerConnection
             peerConnection = peerConnectionFactory.makePeerConnection(
                 coroutineScope = sessionManagerScope,
@@ -208,8 +291,26 @@ class WebRTCScreenCaptureService : Service() {
                         put("sdpMLineIndex", iceCandidate.sdpMLineIndex)
                     }
                     server.sendMessage(jsonCandidate.toString())
+                },
+                onIceConnectionChange = { state ->
+                    when (state) {
+                        PeerConnection.IceConnectionState.CONNECTED -> {
+                            isIceConnected = true
+                            logConn("*** ICE CONNECTED - Ready to send frames ***")
+                            // Force frame delivery - WebRTC will request keyframes via RTCP as needed
+                            forceKeyframe()
+                        }
+                        PeerConnection.IceConnectionState.DISCONNECTED,
+                        PeerConnection.IceConnectionState.FAILED,
+                        PeerConnection.IceConnectionState.CLOSED -> {
+                            isIceConnected = false
+                            firstFrameSentAfterConnect = false
+                        }
+                        else -> {}
+                    }
                 }
             )
+            logConn("PeerConnection created")
 
             // Send an answer to the React UI client
             sendAnswer()
@@ -266,11 +367,13 @@ class WebRTCScreenCaptureService : Service() {
      * Send an answer to the React UI client
      */
     private suspend fun sendAnswer() {
+        logConn("sendAnswer (buffer ready: $firstFrameCaptured)")
+
         // Set the offer from the React UI client as remote description
         val setRemoteResult = peerConnection?.setRemoteDescription(offer)
 
         if (!::localVideoTrack.isInitialized) {
-            Log.e(TAG, "sendAnswer: localVideoTrack is not initialized!")
+            Log.e(TAG_CONN, "sendAnswer: localVideoTrack is not initialized!")
             return
         }
 
@@ -312,7 +415,7 @@ class WebRTCScreenCaptureService : Service() {
                 try {
                     scalabilityMode = "L1T1"
                 } catch (e: Exception) {
-                    Log.w(TAG, "sendAnswer: Scalability mode L1T1 not supported: ${e.message}")
+                    Log.w(TAG_CONN, "Scalability mode L1T1 not supported: ${e.message}")
                 }
             }
 
@@ -321,7 +424,7 @@ class WebRTCScreenCaptureService : Service() {
                 // Maintain framerate at all costs for responsiveness
                 RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
             } catch (e: Exception) {
-                Log.w(TAG, "sendAnswer: Degradation preference not supported: ${e.message}")
+                Log.w(TAG_CONN, "Degradation preference not supported: ${e.message}")
             }
 
             // Apply the parameters
@@ -331,6 +434,7 @@ class WebRTCScreenCaptureService : Service() {
         setRemoteResult?.onSuccess {
             // Create an answer SessionDescription for the React UI client
             val answer = peerConnection?.createAnswer()?.getOrThrow()
+
             // Set the answer as a local description
             val result = peerConnection?.setLocalDescription(answer!!)
 
@@ -339,9 +443,8 @@ class WebRTCScreenCaptureService : Service() {
 
             // If setting answer as local description was successful
             result?.onSuccess {
-//                sessionManagerScope.launch {
-//                    observeStatsPeriodically()
-//                }
+                val iceState = peerConnection?.connection?.iceConnectionState()
+                logConn("Answer ready, ICE state: $iceState")
 
                 // Build the answer json
                 val jsonAnswer = JSONObject().apply {
@@ -350,41 +453,123 @@ class WebRTCScreenCaptureService : Service() {
                 }.toString()
                 // Send the answer JSON over the websocket to the signalling server
                 server.sendMessage(jsonAnswer)
-                Log.d(TAG, "sendAnswer: Answer created and sent.")
+
+                // Force initial frame to prevent black screen on connect
+                forceInitialFrame()
             }?.onFailure {
-                Log.e(TAG, "sendAnswer: Failed to set local description: ${it.message}")
+                Log.e(TAG_CONN, "Failed to set local description: ${it.message}")
             }
         }?.onFailure {
-                Log.e(TAG, "sendAnswer: Failed to set remote description: ${it.message}")
+            Log.e(TAG_CONN, "Failed to set remote description: ${it.message}")
+        }
+    }
+
+    private fun forceInitialFrame() {
+        val helper = surfaceTextureHelper
+        if (helper == null) {
+            Log.e(TAG_BUFFER, "surfaceTextureHelper is NULL, cannot force frame")
+            return
+        }
+
+        // With adaptOutputFormat, buffer is preserved
+        if (firstFrameCaptured) {
+            logBuffer("Buffer ready, forcing frame")
+            helper.forceFrame()
+        } else {
+            logBuffer("Buffer not ready, scheduling delayed forceFrame")
+            pendingForceFrame = true
+            // Fallback: small delay if frame not yet captured
+            helper.handler?.postDelayed({
+                logBuffer("Delayed forceFrame (buffer ready: $firstFrameCaptured)")
+                helper.forceFrame()
+            }, 100)
+        }
+    }
+
+    /**
+     * Force frame delivery to WebRTC.
+     *
+     * Strategy:
+     * - Android 13 and below: Restart capture (stop/start) - first frame is always keyframe
+     * - Android 14+: Only use forceFrame() - trust RTCP PLI/FIR for keyframes
+     *
+     * On Android 14+, we cannot manipulate MediaProjection/VirtualDisplay after creation.
+     * The browser will automatically request keyframes via RTCP PLI/FIR when needed.
+     */
+    private fun forceKeyframe() {
+        sessionManagerScope.launch {
+            captureMutex.withLock {
+                if (!isCaptureRunning) {
+                    logBuffer("Cannot force keyframe - capture not running")
+                    return@withLock
+                }
+
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        // Android 14+: Cannot manipulate VirtualDisplay - just force frame delivery
+                        // Browser will request keyframes via RTCP PLI/FIR automatically
+                        logBuffer("Android 14+: Forcing frame delivery (trusting RTCP for keyframes)")
+                        surfaceTextureHelper?.forceFrame()
+                    } else {
+                        // Android 13 and below: Restart capture (proven to work)
+                        logBuffer("Android 13-: Forcing keyframe by restarting capture")
+                        screenCapturer.stopCapture()
+                        delay(50)
+                        screenCapturer.startCapture(streamWidth, streamHeight, TARGET_FPS)
+                        delay(100)
+                        surfaceTextureHelper?.forceFrame()
+                    }
+                    logBuffer("Frame forced successfully")
+                } catch (e: Exception) {
+                    Log.e(TAG_BUFFER, "Error forcing frame: ${e.message}")
+                    surfaceTextureHelper?.forceFrame()
+                }
+            }
         }
     }
 
     /**
      * Update the screen capture resolution when orientation changes.
-     * We stop and restart capturing, reconfigure width/height, and
-     * let the same localVideoTrack continue streaming.
+     *
+     * Strategy:
+     * - Android 13 and below: Use changeCaptureFormat() to update resolution
+     * - Android 14+: Only update VideoSource adapter, don't touch capture
+     *
+     * On Android 14+, changeCaptureFormat() would kill MediaProjection.
+     * Instead, we rely on VideoSource.adaptOutputFormat() which only affects
+     * the output pipeline, not the capture.
      */
     private fun updateCaptureResolution() {
-        // First, stop the current capture
-        try {
-            screenCapturer.stopCapture()
-        } catch (e: Exception) {
-            Log.e(TAG, "updateCaptureResolution: Error stopping capture: ${e.message}")
-        }
+        sessionManagerScope.launch {
+            captureMutex.withLock {
+                if (!isCaptureRunning) {
+                    logBuffer("Cannot update resolution - capture not running")
+                    return@withLock
+                }
 
-        // Recompute the display metrics
-        val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        windowManager.defaultDisplay.getRealMetrics(metrics)
+                val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+                windowManager.defaultDisplay.getRealMetrics(metrics)
+                streamWidth = metrics.widthPixels / 2
+                streamHeight = metrics.heightPixels / 2
 
-        Thread.sleep(500)
-        streamWidth = metrics.widthPixels / 2
-        streamHeight = metrics.heightPixels / 2
-        // Now restart capturing with the new resolution
-        try {
-            Log.d(TAG, "updateCaptureResolution: Restarting capture at ${streamWidth}x${streamHeight}")
-            screenCapturer.startCapture(streamWidth, streamHeight, 30)
-        } catch (e: Exception) {
-            Log.e(TAG, "updateCaptureResolution: Error restarting capture: ${e.message}")
+                logBuffer("Updating resolution to ${streamWidth}x${streamHeight}")
+
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        // Android 14+: Only update VideoSource adapter, don't touch VirtualDisplay
+                        // The capture will continue at the original resolution, but output will be adapted
+                        logBuffer("Android 14+: Adapting output format only")
+                        videoSource.adaptOutputFormat(streamWidth, streamHeight, TARGET_FPS)
+                    } else {
+                        // Android 13 and below: Can safely change capture format
+                        logBuffer("Android 13-: Changing capture format")
+                        screenCapturer.changeCaptureFormat(streamWidth, streamHeight, TARGET_FPS)
+                    }
+                    surfaceTextureHelper?.forceFrame()
+                } catch (e: Exception) {
+                    Log.e(TAG_BUFFER, "Error updating resolution: ${e.message}")
+                }
+            }
         }
     }
 
@@ -397,25 +582,13 @@ class WebRTCScreenCaptureService : Service() {
             val nativePc = peerConnection?.connection
 
             nativePc?.getStats { statsReport ->
-                // statsReport is an RTCStatsReport
-                // The statsMap property is a Map<String, RTCStats>
-                val statsMap = statsReport.statsMap
-
-                // Iterate over the map entries (or just the values)
-                statsMap.values.forEach { singleStat ->
-                    // singleStat is an RTCStats
+                statsReport.statsMap.values.forEach { singleStat ->
                     if (singleStat.type == "outbound-rtp") {
-                        // Check if it's video, or parse fields
                         val qualityReason = singleStat.members["qualityLimitationReason"]?.toString()
                         val framesEncoded = singleStat.members["framesEncoded"]?.toString()
                         val framesDropped = singleStat.members["framesDropped"]?.toString()
 
-                        Log.d(TAG, """
-                observeStatsPeriodically: [Outbound RTP] 
-                qualityLimitationReason: $qualityReason
-                framesEncoded: $framesEncoded
-                framesDropped: $framesDropped
-            """.trimIndent())
+                        Log.d(TAG_CONN, "Stats: quality=$qualityReason, encoded=$framesEncoded, dropped=$framesDropped")
                     }
                 }
             }
@@ -423,34 +596,48 @@ class WebRTCScreenCaptureService : Service() {
     }
 
     fun handleHangup() {
-        Log.d(TAG, "Handling hangup...")
+        logConn("Hangup received, closing connection")
+
+        // Reset streaming state
+        isIceConnected = false
+        firstFrameSentAfterConnect = false
 
         sessionManagerScope.launch {
             peerConnection?.connection?.close()
             peerConnection = null
         }
 
-        try {
-            screenCapturer.stopCapture()
-        } catch (e: Exception) {
-            Log.e(TAG, "handleHangup: Failed to stop screen capture: ${e.message}")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // Android 14+: Keep capture running (Intent is one-time-use)
+            logConn("Connection closed, keeping capture running for reconnection (Android 14+)")
+        } else {
+            // Android 13-: Original behavior - stop capture completely
+            try {
+                screenCapturer.stopCapture()
+            } catch (e: Exception) {
+                Log.e(TAG_BUFFER, "Failed to stop screen capture: ${e.message}")
+            }
+            isCaptureRunning = false
+            logConn("Connection closed, capture stopped")
         }
-
-        localVideoTrack.setEnabled(false)
-        localVideoTrack.dispose()
-        videoSource.dispose()
-        surfaceTextureHelper.dispose()
-
-        surfaceTextureHelper = SurfaceTextureHelper.create(
-            "SurfaceTextureHelperThread",
-            peerConnectionFactory.eglBaseContext
-        )
-
-        Log.d(TAG, "handleHangup: Successfully handled hangup, stream stopped.")
     }
 
-    // Set up a media projection by obtaining a MediaProjection object and creating a virtual display
+    /**
+     * Set up a media projection by obtaining a MediaProjection object and creating a virtual display
+     */
     private fun startProjection(data: Intent?) {
+        if (isCaptureRunning) {
+            logBuffer("Already capturing, skipping")
+            return
+        }
+
+        isCaptureRunning = true
+        logBuffer("Starting projection...")
+
+        // Reset first frame detection flags
+        firstFrameCaptured = false
+        pendingForceFrame = false
+
         val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         val mDisplay = windowManager.defaultDisplay
         mDisplay.getRealMetrics(metrics)
@@ -459,7 +646,14 @@ class WebRTCScreenCaptureService : Service() {
 
         screenCapturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() {
             override fun onStop() {
-                Log.d(TAG, "startProjection: Stopped sharing")
+                logBuffer("MediaProjection stopped")
+                isCaptureRunning = false
+
+                // Android 14+: Mark that we need re-authorization
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    projectionNeedsReauthorization = true
+                    logBuffer("Projection invalidated, will request re-authorization on next client connection")
+                }
             }
         })
 
@@ -467,13 +661,50 @@ class WebRTCScreenCaptureService : Service() {
             adaptOutputFormat(
                 streamWidth,
                 streamHeight,
-                30
+                TARGET_FPS
             )
-            screenCapturer.initialize(surfaceTextureHelper, this@WebRTCScreenCaptureService, capturerObserver)
+
+            // Wrapper to detect first frame capture
+            val capturerObserverWrapper = object : CapturerObserver {
+                override fun onCapturerStarted(success: Boolean) {
+                    capturerObserver.onCapturerStarted(success)
+                    logBuffer("Capturer started: $success")
+                }
+
+                override fun onCapturerStopped() {
+                    capturerObserver.onCapturerStopped()
+                    logBuffer("Capturer stopped")
+                    firstFrameCaptured = false
+                }
+
+                override fun onFrameCaptured(frame: VideoFrame) {
+                    if (!firstFrameCaptured) {
+                        firstFrameCaptured = true
+                        logBuffer("*** First frame captured ***")
+
+                        if (pendingForceFrame) {
+                            pendingForceFrame = false
+                            surfaceTextureHelper?.forceFrame()
+                        }
+                    }
+
+                    // Log first frame sent after ICE connection
+                    if (isIceConnected && !firstFrameSentAfterConnect) {
+                        firstFrameSentAfterConnect = true
+                        logConn("*** STREAMING - First frame sent to client ***")
+                    }
+
+                    capturerObserver.onFrameCaptured(frame)
+                }
+            }
+
+            screenCapturer.initialize(surfaceTextureHelper, this@WebRTCScreenCaptureService, capturerObserverWrapper)
+
             try {
-                screenCapturer.startCapture(streamWidth, streamHeight, 30)
+                screenCapturer.startCapture(streamWidth, streamHeight, TARGET_FPS)
+                logBuffer("Capture started at ${TARGET_FPS}fps, ${streamWidth}x${streamHeight}")
             } catch (e: Exception) {
-                Log.e(TAG, "startProjection: ScreenCapturer failed to start: ${e.message}")
+                Log.e(TAG_BUFFER, "ScreenCapturer failed to start: ${e.message}")
             }
         }
 
@@ -487,4 +718,19 @@ class WebRTCScreenCaptureService : Service() {
             _localVideoTrackFlow.emit(localVideoTrack)
         }
     }
+
+    /**
+     * Trigger re-authorization by launching the permission activity.
+     * Called when projection was invalidated (Android 14+) and client tries to connect.
+     * The appops PROJECT_MEDIA permission set by the backend will skip the user dialog.
+     */
+    private fun triggerReauthorization() {
+        logBuffer("Launching WebRTCScreenCaptureActivity for re-authorization")
+
+        val intent = Intent(this, WebRTCScreenCaptureActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
+    }
+
 }
