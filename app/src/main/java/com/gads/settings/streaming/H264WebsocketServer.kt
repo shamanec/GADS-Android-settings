@@ -15,30 +15,10 @@ class H264WebsocketServer(port: Int, private val screenCaptureService: H264Scree
     private val TAG = "GADS H264 server"
 
     // Called when a new client connects to the WebSocket server.
-    // Immediately sends SPS/PPS configuration frames so the client's decoder can start decoding video frames.
+    // SPS/PPS config frames are sent automatically with every I-frame,
+    // so clients can start decoding at the next keyframe (every 2 seconds by default).
     override fun onOpen(conn: WebSocket?, handshake: ClientHandshake?) {
-        Log.d(TAG, "Client connected: ${conn?.remoteSocketAddress}")
-
-        // Get cached SPS/PPS from the encoder service
-        val (sps, pps) = screenCaptureService.getCachedConfigFrames()
-        if (sps != null && pps != null) {
-            try {
-                val configData = java.io.ByteArrayOutputStream()
-                // Format SPS and PPS with Annex-B start codes for H.264 decoders
-                configData.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
-                configData.write(sps)
-                configData.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
-                configData.write(pps)
-
-                conn?.send(configData.toByteArray())
-                Log.d(TAG, "Sent SPS/PPS config frames to new client (${configData.size()} bytes)")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error sending config frames to new client: ${e.message}")
-                e.printStackTrace()
-            }
-        } else {
-            Log.w(TAG, "No cached SPS/PPS available yet - client connected before encoder initialized")
-        }
+        Log.d(TAG, "Client connected: ${conn?.remoteSocketAddress}. Will receive SPS/PPS with next I-frame.")
     }
 
     override fun onClose(conn: WebSocket?, code: Int, reason: String?, remote: Boolean) {

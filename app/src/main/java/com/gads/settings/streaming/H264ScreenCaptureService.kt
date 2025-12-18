@@ -190,11 +190,29 @@ class H264ScreenCaptureService: Service() {
                                 val data = ByteArray(bufferInfo.size)
                                 encodedData.get(data)
 
-                                // MediaCodec outputs H.264 NALUs in Annex-B format with start codes (0x00 0x00 0x00 0x01)
-                                // This format is ready for Pion WebRTC consumption
-                                // Reference: https://yumichan.net/video-processing/video-compression/introduction-to-h264-nal-unit/
+                                // Check if this is a keyframe (I-frame)
+                                val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
                                 if (data.isNotEmpty()) {
-                                    server?.broadcast(data)
+                                    // For I-frames, prepend SPS/PPS for robustness
+                                    // This allows clients to start decoding at any I-frame without timing issues
+                                    if (isKeyFrame && cachedSPS != null && cachedPPS != null) {
+                                        val outputStream = ByteArrayOutputStream()
+                                        // Write SPS with start code
+                                        outputStream.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
+                                        outputStream.write(cachedSPS)
+                                        // Write PPS with start code
+                                        outputStream.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
+                                        outputStream.write(cachedPPS)
+                                        // Write the I-frame data
+                                        outputStream.write(data)
+
+                                        server?.broadcast(outputStream.toByteArray())
+                                        Log.d(TAG, "Sent I-frame with SPS/PPS prepended (${outputStream.size()} bytes)")
+                                    } else {
+                                        // P-frames sent as-is
+                                        server?.broadcast(data)
+                                    }
                                 }
                             }
 
