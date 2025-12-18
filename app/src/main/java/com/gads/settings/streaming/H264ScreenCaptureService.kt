@@ -55,10 +55,10 @@ class H264ScreenCaptureService: Service() {
     private var mHeight = 0
     private var mRotation = 0
 
-    private var targetFPS = 30
+    private var targetFPS = 40
     private var bitrate = 2000000 // 2 Mbps default
     private var scalingFactor = 2
-    private var iFrameInterval = 2 // Keyframe every 2 seconds
+    private var iFrameInterval = 1 // Keyframe every 2 seconds
     private var configurationChangeReceiver: BroadcastReceiver? = null
 
     private var encoderThread: HandlerThread? = null
@@ -429,6 +429,11 @@ class H264ScreenCaptureService: Service() {
 
         // I-frame (keyframe) interval in seconds - lower means more keyframes (better seeking, higher bitrate)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
+
+        format.setLong(
+            MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER,
+            1_000_000L / targetFPS.toLong() // microseconds
+        )
 
         try {
             // Create H.264 encoder
