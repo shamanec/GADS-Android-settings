@@ -7,6 +7,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.SurfaceTexture
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
@@ -14,6 +15,13 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLExt
+import android.opengl.EGLSurface
+import android.opengl.GLES20
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -23,9 +31,11 @@ import android.util.Log
 import android.view.Display
 import android.view.Surface
 import android.view.WindowManager
-import com.gads.settings.streaming.NotificationConstants.ORIENTATION_CHANGED_ACTION
 import com.gads.settings.streaming.NotificationUtils.getNotification
 import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
 
 // Service that captures the device screen using MediaProjection and encodes it to H.264 video in real-time.
 // The encoded H.264 NALUs are streamed over WebSocket in Annex-B format for consumption by Pion WebRTC.
@@ -75,6 +85,11 @@ class H264ScreenCaptureService: Service() {
     // Reference: https://developer.android.com/reference/android/media/MediaCodec#CSD
     private var cachedSPS: ByteArray? = null
     private var cachedPPS: ByteArray? = null
+
+    // Frame counter for rate limiting output to target FPS
+    // VirtualDisplay captures at screen refresh rate (60Hz+), but we only want to send targetFPS
+    private var frameCounter = 0L
+    private var lastBroadcastTime = 0L
 
     init {
         server = H264WebsocketServer(1991, this)
@@ -279,24 +294,37 @@ class H264ScreenCaptureService: Service() {
     override fun onCreate() {
         super.onCreate()
 
-        // Register broadcast receiver for orientation changes to restart encoder with new dimensions
+        // Register broadcast receiver for system configuration changes (including orientation)
+        // Listen for Intent.ACTION_CONFIGURATION_CHANGED which is sent by the system
         configurationChangeReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
-                if (ORIENTATION_CHANGED_ACTION == intent.action) {
-                    val rotation = mDisplay?.rotation
+                if (Intent.ACTION_CONFIGURATION_CHANGED == intent.action) {
+                    Log.d(TAG, "System configuration change broadcast received!")
+
+                    // Get FRESH display to check current rotation, not cached mDisplay
+                    val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                    val currentDisplay = windowManager.defaultDisplay
+                    val rotation = currentDisplay?.rotation
+
+                    Log.d(TAG, "Previous rotation: $mRotation, Current rotation: $rotation")
+
                     if (rotation != null && rotation != mRotation) {
+                        Log.d(TAG, "Rotation changed! Restarting encoder...")
                         mRotation = rotation
                         try {
                             restartEncoder()
                         } catch (e: Exception) {
+                            Log.e(TAG, "Error restarting encoder: ${e.message}")
                             e.printStackTrace()
                         }
+                    } else {
+                        Log.d(TAG, "Rotation unchanged, ignoring")
                     }
                 }
             }
         }
 
-        val orientationChangeFilter = IntentFilter(ORIENTATION_CHANGED_ACTION)
+        val orientationChangeFilter = IntentFilter(Intent.ACTION_CONFIGURATION_CHANGED)
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -398,7 +426,12 @@ class H264ScreenCaptureService: Service() {
     // Reference: https://developer.android.com/reference/android/media/MediaCodec#using-an-input-surface
     @SuppressLint("WrongConstant")
     private fun createVirtualDisplay() {
-        // Get the real display dimensions
+        // Refresh display reference to get current orientation/dimensions
+        // The Display object doesn't auto-update on rotation, so we must re-fetch it
+        val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        mDisplay = windowManager.defaultDisplay
+
+        // Get the real display dimensions for current orientation
         val metrics = DisplayMetrics()
         mDisplay?.getRealMetrics(metrics)
 
@@ -410,7 +443,9 @@ class H264ScreenCaptureService: Service() {
         mHeight = metricsHeight / scalingFactor
         mDensity = metrics.densityDpi
 
+        val orientation = if (metricsWidth > metricsHeight) "LANDSCAPE" else "PORTRAIT"
         Log.d(TAG, "Creating encoder with resolution: ${mWidth}x${mHeight} @ ${targetFPS}fps, bitrate: $bitrate")
+        Log.d(TAG, "Display metrics: ${metricsWidth}x${metricsHeight} ($orientation), density: $mDensity")
 
         // Configure MediaFormat for H.264 video encoding
         // MIMETYPE_VIDEO_AVC is H.264/AVC codec
