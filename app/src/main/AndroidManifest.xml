@@ -54,6 +54,17 @@
         </activity>
 
         <activity
+            android:name=".streaming.H264ScreenCaptureActivity"
+            android:configChanges="orientation|screenSize"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+            </intent-filter>
+        </activity>
+
+        <activity
             android:name=".webrtc.WebRTCScreenCaptureActivity"
             android:configChanges="orientation|screenSize"
             android:exported="true"
@@ -66,6 +77,12 @@
 
         <service
             android:name=".streaming.MjpegScreenCaptureService"
+            android:foregroundServiceType="mediaProjection"
+            android:exported="true">
+        </service>
+
+        <service
+            android:name=".streaming.H264ScreenCaptureService"
             android:foregroundServiceType="mediaProjection"
             android:exported="true">
         </service>
