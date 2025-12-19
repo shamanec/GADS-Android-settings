@@ -7,7 +7,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.SurfaceTexture
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
@@ -15,13 +14,6 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.opengl.EGL14
-import android.opengl.EGLConfig
-import android.opengl.EGLContext
-import android.opengl.EGLDisplay
-import android.opengl.EGLExt
-import android.opengl.EGLSurface
-import android.opengl.GLES20
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -33,9 +25,6 @@ import android.view.Surface
 import android.view.WindowManager
 import com.gads.settings.streaming.NotificationUtils.getNotification
 import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.FloatBuffer
 
 // Service that captures the device screen using MediaProjection and encodes it to H.264 video in real-time.
 // The encoded H.264 NALUs are streamed over WebSocket in Annex-B format for consumption by Pion WebRTC.
@@ -75,6 +64,9 @@ class H264ScreenCaptureService: Service() {
     private var encoderHandler: Handler? = null
     @Volatile
     private var isEncoding = false
+    private var preferredEncoderName: String? = null
+    private var encoderAttempts = 0
+    private val failedEncoders = mutableSetOf<String>()
 
     var server: H264WebsocketServer? = null
 
@@ -92,9 +84,15 @@ class H264ScreenCaptureService: Service() {
     private var lastBroadcastTime = 0L
 
     init {
-        server = H264WebsocketServer(1991, this)
-        server?.setReuseAddr(true)
-        server?.start()
+        Log.d(TAG, "Service init block started")
+        try {
+            server = H264WebsocketServer(1991, this)
+            server?.isReuseAddr = true
+            server?.start()
+            Log.d(TAG, "WebSocket server started successfully on port 1991")
+        } catch (e: Exception) {
+            Log.e(TAG, "CRITICAL: Failed to start WebSocket server in init: ${e.message}", e)
+        }
     }
 
     companion object {
@@ -158,6 +156,8 @@ class H264ScreenCaptureService: Service() {
         Thread {
             val bufferInfo = MediaCodec.BufferInfo()
             val timeoutUs = 10000L // 10ms timeout for dequeueOutputBuffer
+            var consecutiveErrors = 0
+            val maxConsecutiveErrors = 5
 
             Log.d(TAG, "Encoder output thread started")
 
@@ -165,6 +165,11 @@ class H264ScreenCaptureService: Service() {
                 try {
                     // Try to get an output buffer from the encoder with encoded data
                     val outputBufferIndex = mMediaCodec?.dequeueOutputBuffer(bufferInfo, timeoutUs) ?: -1
+
+                    // Reset error counter on successful dequeue
+                    if (outputBufferIndex >= 0 || outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        consecutiveErrors = 0
+                    }
 
                     when {
                         // MediaCodec signals format changed, which contains SPS/PPS in the codec-specific data (CSD)
@@ -196,6 +201,11 @@ class H264ScreenCaptureService: Service() {
                         // Valid output buffer with encoded frame data
                         outputBufferIndex >= 0 -> {
                             val encodedData = mMediaCodec?.getOutputBuffer(outputBufferIndex)
+
+                            // Reset attempt counter on successful frame output
+                            if (encoderAttempts > 0) {
+                                encoderAttempts = 0
+                            }
 
                             if (encodedData != null && bufferInfo.size > 0) {
                                 // Position the buffer to read the encoded frame data
@@ -241,9 +251,35 @@ class H264ScreenCaptureService: Service() {
                     }
 
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error in encoder output thread: ${e.message}")
-                    e.printStackTrace()
-                    break
+                    consecutiveErrors++
+                    Log.e(TAG, "Error in encoder output thread (${consecutiveErrors}/${maxConsecutiveErrors}): ${e.message}")
+
+                    // If we get too many consecutive errors, the encoder has crashed
+                    if (consecutiveErrors >= maxConsecutiveErrors) {
+                        Log.e(TAG, "Encoder crashed after $consecutiveErrors consecutive errors")
+
+                        // Mark current encoder as failed
+                        preferredEncoderName?.let {
+                            Log.w(TAG, "Marking encoder as failed: $it")
+                            failedEncoders.add(it)
+                        }
+
+                        // If we haven't exhausted all encoder attempts, try a different one
+                        if (encoderAttempts < 2) {
+                            Log.w(TAG, "Attempting to restart with alternative encoder (attempt ${encoderAttempts + 1})")
+                            preferredEncoderName = null // Clear to force trying next encoder
+                            encoderAttempts++
+
+                            // Restart with next encoder in the list
+                            encoderHandler?.post {
+                                releaseEncoder()
+                                createVirtualDisplay()
+                            }
+                        }
+                        break
+                    }
+
+                    Thread.sleep(100)
                 }
             }
 
@@ -293,6 +329,7 @@ class H264ScreenCaptureService: Service() {
     @SuppressLint("UnspecifiedRegisterReceiverFlag")
     override fun onCreate() {
         super.onCreate()
+        Log.d(TAG, "onCreate() called")
 
         // Register broadcast receiver for system configuration changes (including orientation)
         // Listen for Intent.ACTION_CONFIGURATION_CHANGED which is sent by the system
@@ -363,19 +400,31 @@ class H264ScreenCaptureService: Service() {
 
     // The onStartCommand() method is called by the Android system when the service is started
     override fun onStartCommand(intent: Intent, flags: Int, startId: Int): Int {
+        Log.d(TAG, "onStartCommand() called")
+
         if (isStartCommand(intent)) {
-            // Create notification
-            val notification = getNotification(this)
-            // Start it in the foreground
-            startForeground(notification.first, notification.second)
-            // Start projection
-            val resultCode = intent.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED)
-            val data = intent.getParcelableExtra<Intent>("DATA")
-            startProjection(resultCode, data)
+            Log.d(TAG, "START command received")
+            try {
+                // Create notification
+                val notification = getNotification(this)
+                Log.d(TAG, "Notification created")
+                // Start it in the foreground
+                startForeground(notification.first, notification.second)
+                Log.d(TAG, "Service started in foreground")
+                // Start projection
+                val resultCode = intent.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED)
+                val data = intent.getParcelableExtra<Intent>("DATA")
+                Log.d(TAG, "Starting projection with resultCode: $resultCode")
+                startProjection(resultCode, data)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in onStartCommand: ${e.message}", e)
+            }
         } else if (isStopCommand(intent)) {
+            Log.d(TAG, "STOP command received")
             stopProjection()
             stopSelf()
         } else {
+            Log.w(TAG, "Unknown command, stopping service")
             stopSelf()
         }
 
@@ -421,6 +470,71 @@ class H264ScreenCaptureService: Service() {
         }
     }
 
+    // Selects the best available H.264 encoder based on device and previous failures.
+    // Tries hardware encoder first, then falls back to software encoder if hardware fails.
+    // Known problematic devices (Xiaomi on Android 15+) start with software encoder.
+    private fun selectEncoder(): MediaCodec? {
+        val manufacturer = Build.MANUFACTURER.lowercase()
+        val isProblematicDevice = manufacturer.contains("xiaomi") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM
+
+        // If we've already found a working encoder and it hasn't failed, use it
+        if (preferredEncoderName != null && !failedEncoders.contains(preferredEncoderName)) {
+            try {
+                Log.d(TAG, "Using previously successful encoder: $preferredEncoderName")
+                return MediaCodec.createByCodecName(preferredEncoderName!!)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to create preferred encoder $preferredEncoderName: ${e.message}")
+                failedEncoders.add(preferredEncoderName!!)
+                preferredEncoderName = null
+            }
+        }
+
+        // List of encoders to try in order of preference
+        val encodersToTry = if (isProblematicDevice) {
+            // Start with software encoder for known problematic devices
+            Log.d(TAG, "Detected problematic device (Xiaomi Android 15+), preferring software encoder")
+            listOf("c2.android.avc.encoder", "OMX.google.h264.encoder", null)
+        } else {
+            // Try hardware first, then software fallback for other devices
+            listOf(null, "c2.android.avc.encoder", "OMX.google.h264.encoder")
+        }
+
+        for (encoderName in encodersToTry) {
+            // Skip encoders that have previously failed
+            val codecToTry = if (encoderName == null) {
+                try {
+                    val defaultCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                    if (failedEncoders.contains(defaultCodec.name)) {
+                        Log.d(TAG, "Skipping previously failed encoder: ${defaultCodec.name}")
+                        defaultCodec.release()
+                        continue
+                    }
+                    defaultCodec.name
+                } catch (e: Exception) {
+                    continue
+                }
+            } else {
+                if (failedEncoders.contains(encoderName)) {
+                    Log.d(TAG, "Skipping previously failed encoder: $encoderName")
+                    continue
+                }
+                encoderName
+            }
+
+            try {
+                val codec = MediaCodec.createByCodecName(codecToTry)
+                Log.d(TAG, "Successfully created encoder: ${codec.name}")
+                preferredEncoderName = codec.name
+                return codec
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to create encoder $codecToTry: ${e.message}")
+                failedEncoders.add(codecToTry)
+            }
+        }
+
+        throw RuntimeException("No suitable H.264 encoder found (tried ${failedEncoders.size} encoders)")
+    }
+
     // Creates and configures the H.264 encoder and virtual display for screen capture.
     // Flow: MediaProjection -> VirtualDisplay -> Surface -> MediaCodec (H.264 encoder) -> WebSocket
     // Reference: https://developer.android.com/reference/android/media/MediaCodec#using-an-input-surface
@@ -439,8 +553,9 @@ class H264ScreenCaptureService: Service() {
         val metricsHeight = metrics.heightPixels
 
         // Scale down resolution to reduce encoding load and bandwidth
-        mWidth = metricsWidth / scalingFactor
-        mHeight = metricsHeight / scalingFactor
+        // Align to multiples of 16 for hardware encoder compatibility
+        mWidth = (metricsWidth / scalingFactor / 16) * 16
+        mHeight = (metricsHeight / scalingFactor / 16) * 16
         mDensity = metrics.densityDpi
 
         val orientation = if (metricsWidth > metricsHeight) "LANDSCAPE" else "PORTRAIT"
@@ -465,15 +580,19 @@ class H264ScreenCaptureService: Service() {
         // I-frame (keyframe) interval in seconds - lower means more keyframes (better seeking, higher bitrate)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
 
-        format.setLong(
-            MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER,
-            1_000_000L / targetFPS.toLong() // microseconds
-        )
+        // KEY_REPEAT_PREVIOUS_FRAME_AFTER causes crashes on some devices (Xiaomi/Android 15)
+        // Only set it if Android version is less than 15
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            format.setLong(
+                MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER,
+                1_000_000L / targetFPS.toLong() // microseconds
+            )
+        }
 
         try {
-            // Create H.264 encoder
+            // Create H.264 encoder using smart selection
             // Reference: https://developer.android.com/reference/android/media/MediaCodec
-            mMediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            mMediaCodec = selectEncoder()
             mMediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
 
             // Create input surface - the virtual display will render to this surface
