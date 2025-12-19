@@ -67,6 +67,8 @@ class H264ScreenCaptureService: Service() {
     private var preferredEncoderName: String? = null
     private var encoderAttempts = 0
     private val failedEncoders = mutableSetOf<String>()
+    private var firstFrameSent = false
+    private var maxSize = 0 // Track current max resolution for fallback, 0 means no limit
 
     var server: H264WebsocketServer? = null
 
@@ -96,6 +98,10 @@ class H264ScreenCaptureService: Service() {
     }
 
     companion object {
+        // Resolution fallback values for encoder failures (in descending order)
+        // Try these resolutions before falling back to software encoder
+        private val MAX_SIZE_FALLBACK = intArrayOf(2560, 1920, 1600, 1280, 1024, 800)
+
         fun getStartIntent(context: Context?, resultCode: Int, data: Intent?): Intent {
             val intent = Intent(context, H264ScreenCaptureService::class.java)
             intent.putExtra("ACTION", "START")
@@ -148,14 +154,33 @@ class H264ScreenCaptureService: Service() {
         return DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
     }
 
+    // Choose next smaller resolution from fallback list for encoder retry
+    // Returns 0 if no smaller resolution is available (must fail)
+    private fun chooseMaxSizeFallback(currentWidth: Int, currentHeight: Int): Int {
+        val currentMaxSize = maxOf(currentWidth, currentHeight)
+        for (value in MAX_SIZE_FALLBACK) {
+            if (value < currentMaxSize) {
+                // Found a smaller value to reduce the video size
+                Log.d(TAG, "Choosing fallback resolution: max dimension = $value (current: $currentMaxSize)")
+                return value
+            }
+        }
+        // No fallback available, must fail definitively
+        Log.d(TAG, "No resolution fallback available for ${currentWidth}x${currentHeight}")
+        return 0
+    }
+
     // Continuously reads encoded H.264 NALUs from MediaCodec output buffers and sends them to WebSocket clients.
     // This thread runs until isEncoding is set to false.
     // Reference: https://developer.android.com/reference/android/media/MediaCodec#asynchronous-processing-using-buffers
     private fun startEncoderOutputThread() {
         isEncoding = true
         Thread {
+            // Some devices (Meizu) deadlock if the video encoding thread has no Looper
+            // Reference: https://github.com/Genymobile/scrcpy
+            android.os.Looper.prepare()
+
             val bufferInfo = MediaCodec.BufferInfo()
-            val timeoutUs = 10000L // 10ms timeout for dequeueOutputBuffer
             var consecutiveErrors = 0
             val maxConsecutiveErrors = 5
 
@@ -163,13 +188,9 @@ class H264ScreenCaptureService: Service() {
 
             while (isEncoding) {
                 try {
-                    // Try to get an output buffer from the encoder with encoded data
-                    val outputBufferIndex = mMediaCodec?.dequeueOutputBuffer(bufferInfo, timeoutUs) ?: -1
-
-                    // Reset error counter on successful dequeue
-                    if (outputBufferIndex >= 0 || outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        consecutiveErrors = 0
-                    }
+                    // Blocking dequeue (timeout -1) is more efficient and eliminates INFO_TRY_AGAIN_LATER
+                    // Reference: scrcpy uses blocking dequeue for better performance
+                    val outputBufferIndex = mMediaCodec?.dequeueOutputBuffer(bufferInfo, -1) ?: -1
 
                     when {
                         // MediaCodec signals format changed, which contains SPS/PPS in the codec-specific data (CSD)
@@ -215,8 +236,16 @@ class H264ScreenCaptureService: Service() {
                                 val data = ByteArray(bufferInfo.size)
                                 encodedData.get(data)
 
+                                // Check if this is a config packet (SPS/PPS) vs actual frame
+                                val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                                 // Check if this is a keyframe (I-frame)
                                 val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
+                                // Only count actual frames (not config packets) for error recovery tracking
+                                if (!isConfig) {
+                                    firstFrameSent = true
+                                    consecutiveErrors = 0
+                                }
 
                                 if (data.isNotEmpty()) {
                                     // For I-frames, prepend SPS/PPS for robustness
@@ -244,10 +273,7 @@ class H264ScreenCaptureService: Service() {
                             // Return the buffer to the codec for reuse
                             mMediaCodec?.releaseOutputBuffer(outputBufferIndex, false)
                         }
-
-                        outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                            // No output available yet, will try again in next iteration
-                        }
+                        // INFO_TRY_AGAIN_LATER is never returned with blocking dequeue (timeout -1)
                     }
 
                 } catch (e: Exception) {
@@ -257,6 +283,24 @@ class H264ScreenCaptureService: Service() {
                     // If we get too many consecutive errors, the encoder has crashed
                     if (consecutiveErrors >= maxConsecutiveErrors) {
                         Log.e(TAG, "Encoder crashed after $consecutiveErrors consecutive errors")
+
+                        // If this is before the first frame and we can reduce resolution, try that first
+                        if (!firstFrameSent) {
+                            val newMaxSize = chooseMaxSizeFallback(mWidth, mHeight)
+                            if (newMaxSize > 0) {
+                                Log.w(TAG, "Retrying with reduced resolution: max dimension = $newMaxSize")
+                                maxSize = newMaxSize
+                                consecutiveErrors = 0 // Reset for resolution retry
+
+                                encoderHandler?.post {
+                                    releaseEncoder()
+                                    createVirtualDisplay()
+                                }
+                                break
+                            }
+                            // No resolution fallback available, fall through to encoder fallback
+                            Log.w(TAG, "No resolution fallback available, trying different encoder")
+                        }
 
                         // Mark current encoder as failed
                         preferredEncoderName?.let {
@@ -465,6 +509,8 @@ class H264ScreenCaptureService: Service() {
     // Restarts the encoder, typically called when orientation changes to adjust resolution.
     private fun restartEncoder() {
         encoderHandler?.post {
+            // Keep the working maxSize - encoder limitations don't change with orientation
+            // If 1280px was the max that worked, it will still be the max in the new orientation
             releaseEncoder()
             createVirtualDisplay()
         }
@@ -554,8 +600,22 @@ class H264ScreenCaptureService: Service() {
 
         // Scale down resolution to reduce encoding load and bandwidth
         // Align to multiples of 16 for hardware encoder compatibility
-        mWidth = (metricsWidth / scalingFactor / 16) * 16
-        mHeight = (metricsHeight / scalingFactor / 16) * 16
+        var targetWidth = (metricsWidth / scalingFactor / 16) * 16
+        var targetHeight = (metricsHeight / scalingFactor / 16) * 16
+
+        // Apply maxSize limit if set (for resolution fallback)
+        if (maxSize > 0) {
+            val currentMaxDimension = maxOf(targetWidth, targetHeight)
+            if (currentMaxDimension > maxSize) {
+                val scale = maxSize.toFloat() / currentMaxDimension
+                targetWidth = ((targetWidth * scale).toInt() / 16) * 16
+                targetHeight = ((targetHeight * scale).toInt() / 16) * 16
+                Log.d(TAG, "Applied maxSize limit $maxSize: ${targetWidth}x${targetHeight}")
+            }
+        }
+
+        mWidth = targetWidth
+        mHeight = targetHeight
         mDensity = metrics.densityDpi
 
         val orientation = if (metricsWidth > metricsHeight) "LANDSCAPE" else "PORTRAIT"
@@ -571,22 +631,38 @@ class H264ScreenCaptureService: Service() {
         // instead of manually providing YUV buffers
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
 
+        // Set color range for better color reproduction (API 24+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+        }
+
         // Bitrate in bits per second - controls output quality and size
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
 
-        // Target frames per second
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, targetFPS)
+        // Must be present to configure the encoder, but does not impact the actual frame rate
+        // The actual FPS is controlled by KEY_MAX_FPS_TO_ENCODER
+        // Reference: scrcpy uses constant 60fps here
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, 60)
 
         // I-frame (keyframe) interval in seconds - lower means more keyframes (better seeking, higher bitrate)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
 
+        // Display the very first frame, and recover from bad quality when no new frames
+        // Use 100ms delay as recommended by scrcpy (more conservative than calculated value)
         // KEY_REPEAT_PREVIOUS_FRAME_AFTER causes crashes on some devices (Xiaomi/Android 15)
         // Only set it if Android version is less than 15
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
             format.setLong(
                 MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER,
-                1_000_000L / targetFPS.toLong() // microseconds
+                100_000L // 100ms in microseconds
             )
+        }
+
+        // The key existed privately before Android 10, but we only set it on API 29+
+        // This controls the actual frame rate (not KEY_FRAME_RATE which is just for configuration)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            format.setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, targetFPS.toFloat())
+            Log.d(TAG, "Set max FPS to encoder: $targetFPS")
         }
 
         try {
@@ -644,6 +720,9 @@ class H264ScreenCaptureService: Service() {
             // Release the input surface
             mInputSurface?.release()
             mInputSurface = null
+
+            // Reset first frame flag for next encoder session
+            firstFrameSent = false
 
             Log.d(TAG, "Encoder released")
         } catch (e: Exception) {
