@@ -54,8 +54,8 @@ class H264ScreenCaptureService: Service() {
     private var mHeight = 0
     private var mRotation = 0
 
-    private var targetFPS = 40
-    private var bitrate = 2000000 // 2 Mbps default
+    private var targetFPS = 30
+    private var bitrate = 4000000 // 4 Mbps default
     private var scalingFactor = 2
     private var iFrameInterval = 1 // Keyframe every 2 seconds
     private var configurationChangeReceiver: BroadcastReceiver? = null
@@ -79,11 +79,6 @@ class H264ScreenCaptureService: Service() {
     // Reference: https://developer.android.com/reference/android/media/MediaCodec#CSD
     private var cachedSPS: ByteArray? = null
     private var cachedPPS: ByteArray? = null
-
-    // Frame counter for rate limiting output to target FPS
-    // VirtualDisplay captures at screen refresh rate (60Hz+), but we only want to send targetFPS
-    private var frameCounter = 0L
-    private var lastBroadcastTime = 0L
 
     init {
         Log.d(TAG, "Service init block started")
@@ -118,8 +113,9 @@ class H264ScreenCaptureService: Service() {
     }
 
     fun setTargetFPS(fps: Int) {
-//        this.targetFPS = fps
+        this.targetFPS = fps
         Log.d(TAG, "Target FPS set to: $targetFPS")
+        restartEncoder()
     }
 
     fun setBitrate(bitrate: Int) {
@@ -128,7 +124,7 @@ class H264ScreenCaptureService: Service() {
     }
 
     fun setScalingFactor(scalingFactor: Int) {
-        this.scalingFactor = if (scalingFactor == 50) 2 else 4
+//        this.scalingFactor = if (scalingFactor == 50) 2 else 4
         Log.d(TAG, "Scaling factor set to: $scalingFactor")
     }
 
