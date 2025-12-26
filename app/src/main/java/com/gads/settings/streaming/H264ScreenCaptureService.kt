@@ -244,10 +244,25 @@ class H264ScreenCaptureService: Service() {
                                 }
 
                                 if (data.isNotEmpty()) {
+                                    val outputStream = ByteArrayOutputStream()
+
+                                    // Write presentation timestamp (8 bytes, big-endian long)
+                                    // This is critical for Pion to properly pace frames and avoid delays
+                                    val pts = bufferInfo.presentationTimeUs
+                                    outputStream.write(byteArrayOf(
+                                        (pts shr 56).toByte(),
+                                        (pts shr 48).toByte(),
+                                        (pts shr 40).toByte(),
+                                        (pts shr 32).toByte(),
+                                        (pts shr 24).toByte(),
+                                        (pts shr 16).toByte(),
+                                        (pts shr 8).toByte(),
+                                        pts.toByte()
+                                    ))
+
                                     // For I-frames, prepend SPS/PPS for robustness
                                     // This allows clients to start decoding at any I-frame without timing issues
                                     if (isKeyFrame && cachedSPS != null && cachedPPS != null) {
-                                        val outputStream = ByteArrayOutputStream()
                                         // Write SPS with start code
                                         outputStream.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
                                         outputStream.write(cachedSPS)
@@ -258,10 +273,11 @@ class H264ScreenCaptureService: Service() {
                                         outputStream.write(data)
 
                                         server?.broadcast(outputStream.toByteArray())
-                                        Log.d(TAG, "Sent I-frame with SPS/PPS prepended (${outputStream.size()} bytes)")
+                                        Log.d(TAG, "Sent I-frame with timestamp $pts and SPS/PPS prepended (${outputStream.size()} bytes)")
                                     } else {
-                                        // P-frames sent as-is
-                                        server?.broadcast(data)
+                                        // P-frames with timestamp prepended
+                                        outputStream.write(data)
+                                        server?.broadcast(outputStream.toByteArray())
                                     }
                                 }
                             }
@@ -638,7 +654,7 @@ class H264ScreenCaptureService: Service() {
         // Must be present to configure the encoder, but does not impact the actual frame rate
         // The actual FPS is controlled by KEY_MAX_FPS_TO_ENCODER
         // Reference: scrcpy uses constant 60fps here
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, 60)
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, targetFPS)
 
         // I-frame (keyframe) interval in seconds - lower means more keyframes (better seeking, higher bitrate)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
