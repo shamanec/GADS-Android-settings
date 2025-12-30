@@ -61,7 +61,8 @@ class StreamPeerConnectionFactory(
                 eglContext = eglBaseContext,
                 enableIntelVp8Encoder = true,
                 enableH264HighProfile = true,
-                resolutionAdjustment = ResolutionAdjustment.MULTIPLE_OF_16
+                // NONE for screen sharing - pixel-perfect fidelity, no macroblock alignment needed
+                resolutionAdjustment = ResolutionAdjustment.NONE
             )
         }
     }
