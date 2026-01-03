@@ -273,9 +273,7 @@ class H264Server(
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
 
             // Color range for better color reproduction (API 24+)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
-            }
+            format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
 
             // KEY_REPEAT_PREVIOUS_FRAME_AFTER causes crashes on some devices (Xiaomi/Android 15)
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
@@ -335,8 +333,10 @@ class H264Server(
     // SurfaceControl display token (for fallback)
     private var surfaceControlDisplay: android.os.IBinder? = null
 
-    // Event-driven orientation monitoring (replaces polling thread)
-    private var displayListenerHandle: DisplayManagerWrapper.DisplayListenerHandle? = null
+    // Orientation monitoring
+    private var orientationMonitorThread: Thread? = null
+    @Volatile
+    private var monitoringOrientation = false
 
     /**
      * Create VirtualDisplay using hidden APIs (app_process mode).
@@ -684,42 +684,64 @@ class H264Server(
     }
 
     /**
-     * Start event-driven orientation monitoring using DisplayManager.registerDisplayListener().
-     * Much more efficient than polling - only triggers on actual display changes.
-     * Reference: scrcpy DisplayManager.java lines 202-240
+     * Start orientation monitoring.
+     *
+     * Android 14+ has broken DisplayListener, so we use polling as a reliable fallback.
+     * Reference: scrcpy DisplaySizeMonitor.java lines 24-28
      */
     private fun startOrientationMonitoring() {
-        val listener = object : DisplayManagerWrapper.DisplayListener {
-            override fun onDisplayChanged(displayId: Int) {
-                if (displayId == 0) {  // Main display
-                    Log.d(TAG, "Display changed (orientation/size), restarting encoder...")
-                    encoderHandler?.post {
-                        releaseEncoder()
-                        createVirtualDisplay()
+        // For now, use simple polling approach (works on all Android versions)
+        // TODO: Implement DisplayWindowListener for Android 14+ (requires WindowManager wrapper)
+
+        val initialMetrics = getDisplayMetrics()
+        var lastWidth = initialMetrics.widthPixels
+        var lastHeight = initialMetrics.heightPixels
+
+        monitoringOrientation = true
+        orientationMonitorThread = Thread {
+            Log.d(TAG, "Orientation monitoring started (polling every 500ms)")
+
+            while (monitoringOrientation) {
+                try {
+                    Thread.sleep(500)  // Poll every 500ms
+
+                    val metrics = getDisplayMetrics()
+                    val currentWidth = metrics?.widthPixels ?: lastWidth
+                    val currentHeight = metrics?.heightPixels ?: lastHeight
+
+                    // Check if dimensions changed (rotation occurred)
+                    if (currentWidth != lastWidth || currentHeight != lastHeight) {
+                        Log.d(TAG, "Display size changed: ${lastWidth}x${lastHeight} -> ${currentWidth}x${currentHeight}")
+                        Log.d(TAG, "Restarting encoder for new orientation...")
+
+                        lastWidth = currentWidth
+                        lastHeight = currentHeight
+
+                        encoderHandler?.post {
+                            releaseEncoder()
+                            createVirtualDisplay()
+                        }
                     }
+                } catch (e: InterruptedException) {
+                    break
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in orientation monitoring", e)
                 }
             }
-        }
 
-        displayListenerHandle = DisplayManagerWrapper.registerDisplayListener(
-            listener,
-            encoderHandler!!
-        )
-
-        if (displayListenerHandle != null) {
-            Log.d(TAG, "✓ Display listener registered for orientation changes")
-        } else {
-            Log.w(TAG, "Failed to register display listener, orientation changes won't be detected")
+            Log.d(TAG, "Orientation monitoring stopped")
         }
+        orientationMonitorThread?.start()
     }
 
     /**
-     * Stop orientation monitoring by unregistering the display listener.
+     * Stop orientation monitoring.
      */
     private fun stopOrientationMonitoring() {
-        DisplayManagerWrapper.unregisterDisplayListener(displayListenerHandle)
-        displayListenerHandle = null
-        Log.d(TAG, "Display listener unregistered")
+        monitoringOrientation = false
+        orientationMonitorThread?.interrupt()
+        orientationMonitorThread = null
+        Log.d(TAG, "Orientation monitoring stopped")
     }
 
     /**

@@ -168,6 +168,16 @@ object DisplayManagerWrapper {
         return try {
             val displayManager = getDisplayManager()
 
+            // DEBUG: List all register methods
+            Log.d(TAG, "=== Looking for registerDisplayListener methods ===")
+            for (method in displayManager.javaClass.methods) {
+                if (method.name.contains("register") || method.name.contains("Display")) {
+                    val params = method.parameterTypes.joinToString(", ") { it.simpleName }
+                    Log.d(TAG, "  ${method.name}($params)")
+                }
+            }
+            Log.d(TAG, "=== END register methods ===")
+
             // Create dynamic proxy for android.hardware.display.DisplayManager$DisplayListener
             val displayListenerClass = Class.forName("android.hardware.display.DisplayManager\$DisplayListener")
             val displayListenerProxy = java.lang.reflect.Proxy.newProxyInstance(
@@ -175,7 +185,16 @@ object DisplayManagerWrapper {
                 arrayOf(displayListenerClass)
             ) { _, method, args ->
                 when (method.name) {
+                    "onDisplayAdded" -> {
+                        Log.d(TAG, "Display added: ${args[0]}")
+                        null
+                    }
+                    "onDisplayRemoved" -> {
+                        Log.d(TAG, "Display removed: ${args[0]}")
+                        null
+                    }
                     "onDisplayChanged" -> {
+                        Log.d(TAG, "Display changed: ${args[0]}")
                         listener.onDisplayChanged(args[0] as Int)
                         null
                     }
@@ -184,33 +203,68 @@ object DisplayManagerWrapper {
                 }
             }
 
-            // Try different registerDisplayListener method signatures based on Android version
+            // Try different registerDisplayListener method signatures
+            var registered = false
+
+            // Try 4-param: registerDisplayListener(listener, handler, long eventsMask, String packageName)
             try {
-                // Try newest signature: registerDisplayListener(listener, handler, long eventsMask, String packageName)
-                displayManager.javaClass
-                    .getMethod("registerDisplayListener", displayListenerClass, Handler::class.java, Long::class.javaPrimitiveType, String::class.java)
-                    .invoke(displayManager, displayListenerProxy, handler, EVENT_FLAG_DISPLAY_CHANGED, "com.android.shell")
-                Log.d(TAG, "Registered display listener with 4-param signature")
+                val method = displayManager.javaClass.getMethod(
+                    "registerDisplayListener",
+                    displayListenerClass,
+                    Handler::class.java,
+                    Long::class.javaPrimitiveType,
+                    String::class.java
+                )
+                method.invoke(displayManager, displayListenerProxy, handler, EVENT_FLAG_DISPLAY_CHANGED, "com.android.shell")
+                Log.d(TAG, "✓ Registered display listener with 4-param signature")
+                registered = true
             } catch (e: NoSuchMethodException) {
+                Log.d(TAG, "4-param signature not found")
+            }
+
+            // Try 3-param: registerDisplayListener(listener, handler, long eventsMask)
+            if (!registered) {
                 try {
-                    // Try: registerDisplayListener(listener, handler, long eventsMask)
-                    displayManager.javaClass
-                        .getMethod("registerDisplayListener", displayListenerClass, Handler::class.java, Long::class.javaPrimitiveType)
-                        .invoke(displayManager, displayListenerProxy, handler, EVENT_FLAG_DISPLAY_CHANGED)
-                    Log.d(TAG, "Registered display listener with 3-param signature")
-                } catch (e2: NoSuchMethodException) {
-                    // Fallback: registerDisplayListener(listener, handler)
-                    displayManager.javaClass
-                        .getMethod("registerDisplayListener", displayListenerClass, Handler::class.java)
-                        .invoke(displayManager, displayListenerProxy, handler)
-                    Log.d(TAG, "Registered display listener with 2-param signature")
+                    val method = displayManager.javaClass.getMethod(
+                        "registerDisplayListener",
+                        displayListenerClass,
+                        Handler::class.java,
+                        Long::class.javaPrimitiveType
+                    )
+                    method.invoke(displayManager, displayListenerProxy, handler, EVENT_FLAG_DISPLAY_CHANGED)
+                    Log.d(TAG, "✓ Registered display listener with 3-param signature")
+                    registered = true
+                } catch (e: NoSuchMethodException) {
+                    Log.d(TAG, "3-param signature not found")
                 }
             }
 
-            DisplayListenerHandle(displayListenerProxy)
+            // Try 2-param: registerDisplayListener(listener, handler)
+            if (!registered) {
+                try {
+                    val method = displayManager.javaClass.getMethod(
+                        "registerDisplayListener",
+                        displayListenerClass,
+                        Handler::class.java
+                    )
+                    method.invoke(displayManager, displayListenerProxy, handler)
+                    Log.d(TAG, "✓ Registered display listener with 2-param signature")
+                    registered = true
+                } catch (e: NoSuchMethodException) {
+                    Log.d(TAG, "2-param signature not found")
+                }
+            }
+
+            if (registered) {
+                DisplayListenerHandle(displayListenerProxy)
+            } else {
+                Log.w(TAG, "No compatible registerDisplayListener signature found")
+                null
+            }
 
         } catch (e: Exception) {
             Log.e(TAG, "Could not register display listener", e)
+            e.printStackTrace()
             null
         }
     }

@@ -33,7 +33,7 @@ data class EncoderConfig(
      * - 30 FPS: Good balance of smoothness and performance
      * - 60 FPS: Smoother but requires more CPU and bandwidth
      */
-    val fps: Int = 30,
+    val fps: Int = 60,
 
     /**
      * Resolution scaling factor (downscale from device screen).
