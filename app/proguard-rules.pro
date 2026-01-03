@@ -29,8 +29,8 @@
 -keep class com.gads.settings.RemoteControlServer { *; }
 -keep class com.gads.settings.InputInjector { *; }
 
-# Keep ScrcpyH264Server for app_process execution
--keep class com.gads.settings.server.H264ServerKt {
+# Keep H264Server for app_process execution
+-keep class com.gads.settings.server.H264Server {
     public static void main(java.lang.String[]);
 }
 -keep class com.gads.settings.server.H264Server { *; }
