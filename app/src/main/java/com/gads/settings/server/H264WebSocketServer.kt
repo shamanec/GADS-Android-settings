@@ -21,7 +21,7 @@ import java.nio.ByteBuffer
  * Based on H264WebsocketServer.kt with adaptations for ScrcpyH264Server.
  */
 class H264WebSocketServer(
-    port: Int = 1992,
+    port: Int = 1991,
     private val server: H264Server
 ) : WebSocketServer(InetSocketAddress(port)) {
 

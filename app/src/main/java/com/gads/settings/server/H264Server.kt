@@ -43,7 +43,7 @@ class H264Server(
     private val TAG = "GADS H264 Server"
 
     // WebSocket server for broadcasting frames
-    private val websocketServer = H264WebSocketServer(1992, this)
+    private val websocketServer = H264WebSocketServer(1991, this)
 
     // Encoder components
     private var mMediaCodec: MediaCodec? = null
