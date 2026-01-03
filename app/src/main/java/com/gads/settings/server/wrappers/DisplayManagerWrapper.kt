@@ -61,7 +61,7 @@ object DisplayManagerWrapper {
 
             // Try scrcpy's EXACT approach - static method on PUBLIC DisplayManager
             try {
-                Log.d(TAG, "Trying PUBLIC DisplayManager.createVirtualDisplay (scrcpy lines 163-173)...")
+                Log.d(TAG, "Trying PUBLIC DisplayManager.createVirtualDisplay")
                 val method = android.hardware.display.DisplayManager::class.java.getMethod(
                     "createVirtualDisplay",
                     String::class.java,
@@ -74,7 +74,7 @@ object DisplayManagerWrapper {
                 val result = method.invoke(null, name, width, height, displayIdToMirror, surface) as? VirtualDisplay
 
                 if (result != null) {
-                    Log.d(TAG, "✓ VirtualDisplay created via PUBLIC DisplayManager (scrcpy method)")
+                    Log.d(TAG, "✓ VirtualDisplay created via PUBLIC DisplayManager")
                     return result
                 }
             } catch (e: NoSuchMethodException) {

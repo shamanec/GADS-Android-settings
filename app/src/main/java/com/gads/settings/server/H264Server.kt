@@ -77,6 +77,7 @@ class H264Server(
     // Threading
     private var encoderThread: HandlerThread? = null
     private var encoderHandler: Handler? = null
+    private var encoderOutputThread: Thread? = null
 
     companion object {
         // Resolution fallback values for encoder failures (in descending order)
@@ -175,12 +176,11 @@ class H264Server(
     }
 
     /**
-     * Set target FPS and restart encoder to apply.
+     * Set target FPS (takes effect on next encoder restart).
      */
     fun setTargetFPS(fps: Int) {
         this.targetFPS = fps
         Log.d(TAG, "Target FPS set to: $targetFPS")
-        restartEncoder()
     }
 
     /**
@@ -200,12 +200,11 @@ class H264Server(
     }
 
     /**
-     * Set I-frame interval and restart encoder to apply.
+     * Set I-frame interval (takes effect on next encoder restart).
      */
     fun setIFrameInterval(interval: Int) {
         this.iFrameInterval = interval
         Log.d(TAG, "I-frame interval set to: $iFrameInterval seconds")
-        restartEncoder()
     }
 
     /**
@@ -218,11 +217,15 @@ class H264Server(
     /**
      * Restart the encoder (e.g., for orientation change or config change).
      */
-    private fun restartEncoder() {
+    fun restartEncoder() {
         encoderHandler?.post {
             releaseEncoder()
-            createVirtualDisplay()
         }
+        // Add delay to ensure MediaCodec native resources are fully released
+        // before creating new encoder (prevents Error 0xffffffe0)
+        encoderHandler?.postDelayed({
+            createVirtualDisplay()
+        }, 200) // 200ms delay
     }
 
     /**
@@ -519,7 +522,7 @@ class H264Server(
      */
     private fun startEncoderOutputThread() {
         isEncoding = true
-        Thread {
+        encoderOutputThread = Thread {
             // Some devices (Meizu) deadlock if the video encoding thread has no Looper
             android.os.Looper.prepare()
 
@@ -529,10 +532,10 @@ class H264Server(
 
             Log.d(TAG, "Encoder output thread started")
 
-            while (isEncoding) {
+            while (isEncoding && !Thread.currentThread().isInterrupted) {
                 try {
-                    // Blocking dequeue (timeout -1) for efficiency
-                    val outputBufferIndex = mMediaCodec?.dequeueOutputBuffer(bufferInfo, -1) ?: -1
+                    // Use timeout to allow thread interruption (1 second)
+                    val outputBufferIndex = mMediaCodec?.dequeueOutputBuffer(bufferInfo, 1000000) ?: -1
 
                     when {
                         // MediaCodec signals format changed, extract SPS/PPS
@@ -616,6 +619,9 @@ class H264Server(
                         }
                     }
 
+                } catch (e: InterruptedException) {
+                    Log.d(TAG, "Encoder output thread interrupted, exiting")
+                    break
                 } catch (e: Exception) {
                     consecutiveErrors++
                     Log.e(TAG, "Error in encoder output thread ($consecutiveErrors/$maxConsecutiveErrors): ${e.message}")
@@ -633,8 +639,10 @@ class H264Server(
 
                                 encoderHandler?.post {
                                     releaseEncoder()
-                                    createVirtualDisplay()
                                 }
+                                encoderHandler?.postDelayed({
+                                    createVirtualDisplay()
+                                }, 200)
                                 break
                             }
                             Log.w(TAG, "No resolution fallback available, trying different encoder")
@@ -653,8 +661,10 @@ class H264Server(
 
                             encoderHandler?.post {
                                 releaseEncoder()
-                                createVirtualDisplay()
                             }
+                            encoderHandler?.postDelayed({
+                                createVirtualDisplay()
+                            }, 200)
                         }
                         break
                     }
@@ -664,7 +674,8 @@ class H264Server(
             }
 
             Log.d(TAG, "Encoder output thread stopped")
-        }.start()
+        }
+        encoderOutputThread?.start()
     }
 
     /**
@@ -719,8 +730,10 @@ class H264Server(
 
                         encoderHandler?.post {
                             releaseEncoder()
-                            createVirtualDisplay()
                         }
+                        encoderHandler?.postDelayed({
+                            createVirtualDisplay()
+                        }, 200)
                     }
                 } catch (e: InterruptedException) {
                     break
@@ -749,7 +762,28 @@ class H264Server(
      */
     private fun releaseEncoder() {
         try {
+            // Signal encoder output thread to stop
             isEncoding = false
+
+            // Wait for encoder output thread to fully stop before releasing resources
+            // This prevents race conditions when restarting the encoder
+            encoderOutputThread?.let { thread ->
+                if (thread.isAlive) {
+                    Log.d(TAG, "Waiting for encoder output thread to stop...")
+                    thread.interrupt()
+                    try {
+                        thread.join(2000) // Wait up to 2 seconds
+                        if (thread.isAlive) {
+                            Log.w(TAG, "Encoder output thread did not stop in time")
+                        } else {
+                            Log.d(TAG, "Encoder output thread stopped successfully")
+                        }
+                    } catch (e: InterruptedException) {
+                        Log.w(TAG, "Interrupted while waiting for encoder thread to stop")
+                    }
+                }
+            }
+            encoderOutputThread = null
 
             // Release VirtualDisplay (if using DisplayManager approach)
             mVirtualDisplay?.release()
@@ -766,8 +800,18 @@ class H264Server(
             }
             surfaceControlDisplay = null
 
-            mMediaCodec?.stop()
-            mMediaCodec?.release()
+            // Stop and release MediaCodec (wrapped in try-catch for robustness)
+            try {
+                mMediaCodec?.stop()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error stopping MediaCodec: ${e.message}")
+            }
+
+            try {
+                mMediaCodec?.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error releasing MediaCodec: ${e.message}")
+            }
             mMediaCodec = null
 
             mInputSurface?.release()

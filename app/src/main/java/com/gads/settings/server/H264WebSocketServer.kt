@@ -25,7 +25,7 @@ class H264WebSocketServer(
     private val server: H264Server
 ) : WebSocketServer(InetSocketAddress(port)) {
 
-    private val TAG = "GADS Scrcpy WS"
+    private val TAG = "GADS WS"
 
     /**
      * Called when a new client connects to the WebSocket server.
@@ -54,13 +54,16 @@ class H264WebSocketServer(
      */
     override fun onMessage(conn: WebSocket?, message: String) {
         val splitMsg = message.split(":".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
+        var needsRestart = false
 
+        // First pass: set all configuration values
         for (msgPart in splitMsg) {
             when {
                 msgPart.startsWith("targetFPS=") -> {
                     try {
                         val fps = msgPart.split("=")[1].toInt()
                         server.setTargetFPS(fps)
+                        needsRestart = true
                         Log.d(TAG, "Set target FPS to: $fps")
                     } catch (e: Exception) {
                         Log.e(TAG, "Invalid FPS value received: $msgPart", e)
@@ -80,7 +83,14 @@ class H264WebSocketServer(
                 msgPart.startsWith("scalingFactor=") -> {
                     try {
                         val scalingFactor = msgPart.split("=")[1].toInt()
-                        server.setScalingFactor(scalingFactor)
+                        if (scalingFactor == 50) {
+                            server.setScalingFactor(2)
+                        } else if (scalingFactor == 25) {
+                            server.setScalingFactor(4)
+                        } else {
+                            server.setScalingFactor(2)
+                        }
+                        needsRestart = true
                         Log.d(TAG, "Set scaling factor to: $scalingFactor")
                     } catch (e: Exception) {
                         Log.e(TAG, "Invalid scaling factor value received: $msgPart", e)
@@ -91,6 +101,7 @@ class H264WebSocketServer(
                     try {
                         val interval = msgPart.split("=")[1].toInt()
                         server.setIFrameInterval(interval)
+                        needsRestart = true
                         Log.d(TAG, "Set I-frame interval to: $interval seconds")
                     } catch (e: Exception) {
                         Log.e(TAG, "Invalid I-frame interval value received: $msgPart", e)
@@ -101,6 +112,12 @@ class H264WebSocketServer(
                     Log.w(TAG, "Unknown configuration message: $msgPart")
                 }
             }
+        }
+
+        // After all values are set, trigger a single restart if needed
+        if (needsRestart) {
+            Log.d(TAG, "Triggering encoder restart for configuration changes")
+            server.restartEncoder()
         }
     }
 
