@@ -225,7 +225,7 @@ class H264Server(
         // before creating new encoder (prevents Error 0xffffffe0)
         encoderHandler?.postDelayed({
             createVirtualDisplay()
-        }, 200) // 200ms delay
+        }, 500) // 500ms delay - increased to give more time for cleanup after multiple restarts
     }
 
     /**
@@ -642,7 +642,7 @@ class H264Server(
                                 }
                                 encoderHandler?.postDelayed({
                                     createVirtualDisplay()
-                                }, 200)
+                                }, 500)
                                 break
                             }
                             Log.w(TAG, "No resolution fallback available, trying different encoder")
@@ -664,7 +664,7 @@ class H264Server(
                             }
                             encoderHandler?.postDelayed({
                                 createVirtualDisplay()
-                            }, 200)
+                            }, 500)
                         }
                         break
                     }
@@ -733,7 +733,7 @@ class H264Server(
                         }
                         encoderHandler?.postDelayed({
                             createVirtualDisplay()
-                        }, 200)
+                        }, 500)
                     }
                 } catch (e: InterruptedException) {
                     break
@@ -762,6 +762,9 @@ class H264Server(
      */
     private fun releaseEncoder() {
         try {
+            // Stop orientation monitoring first to prevent it from triggering another restart
+            stopOrientationMonitoring()
+
             // Signal encoder output thread to stop
             isEncoding = false
 
