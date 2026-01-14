@@ -29,11 +29,11 @@ class H264WebSocketServer(
 
     /**
      * Called when a new client connects to the WebSocket server.
-     * SPS/PPS config frames are sent automatically with every I-frame,
-     * so clients can start decoding at the next keyframe (every 1-2 seconds by default).
+     * Triggers a screen refresh to ensure the client receives a frame immediately.
      */
     override fun onOpen(conn: WebSocket?, handshake: ClientHandshake?) {
-        Log.d(TAG, "Client connected: ${conn?.remoteSocketAddress}. Will receive SPS/PPS with next I-frame.")
+        Log.d(TAG, "Client connected: ${conn?.remoteSocketAddress}. Triggering screen refresh...")
+        server.triggerScreenRefresh()
     }
 
     override fun onClose(conn: WebSocket?, code: Int, reason: String?, remote: Boolean) {

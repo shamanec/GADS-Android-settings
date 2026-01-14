@@ -215,6 +215,20 @@ class H264Server(
     }
 
     /**
+     * Trigger a screen refresh by showing volume UI.
+     * Volume level doesn't matter for remote control, but the UI forces display update.
+     */
+    fun triggerScreenRefresh() {
+        try {
+            // Press volume down - shows volume UI overlay which forces display update
+            Runtime.getRuntime().exec(arrayOf("input", "keyevent", "KEYCODE_VOLUME_DOWN"))
+            Log.d(TAG, "Triggered screen refresh via volume UI")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to trigger screen refresh: ${e.message}")
+        }
+    }
+
+    /**
      * Restart the encoder (e.g., for orientation change or config change).
      */
     fun restartEncoder() {
@@ -642,6 +656,10 @@ class H264Server(
                                 }
                                 encoderHandler?.postDelayed({
                                     createVirtualDisplay()
+                                    // Trigger screen refresh after recovery
+                                    encoderHandler?.postDelayed({
+                                        triggerScreenRefresh()
+                                    }, 200)
                                 }, 500)
                                 break
                             }
@@ -664,6 +682,10 @@ class H264Server(
                             }
                             encoderHandler?.postDelayed({
                                 createVirtualDisplay()
+                                // Trigger screen refresh after recovery
+                                encoderHandler?.postDelayed({
+                                    triggerScreenRefresh()
+                                }, 200)
                             }, 500)
                         }
                         break
@@ -733,6 +755,10 @@ class H264Server(
                         }
                         encoderHandler?.postDelayed({
                             createVirtualDisplay()
+                            // Trigger screen refresh after encoder restart to get immediate frame
+                            encoderHandler?.postDelayed({
+                                triggerScreenRefresh()
+                            }, 200) // Wait 200ms for encoder to be ready
                         }, 500)
                     }
                 } catch (e: InterruptedException) {
