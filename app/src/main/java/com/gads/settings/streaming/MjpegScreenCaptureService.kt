@@ -340,7 +340,7 @@ class MjpegScreenCaptureService: Service() {
 
     /**
      * Start orientation monitoring using polling approach.
-     * Polls display metrics every 500ms and recreates virtual display if dimensions change.
+     * Polls display metrics every 500ms and resizes virtual display if dimensions change.
      * This is more reliable than DisplayListener on Android 14+.
      */
     private fun startOrientationMonitoring() {
@@ -372,18 +372,12 @@ class MjpegScreenCaptureService: Service() {
                         // Clear the image queue to avoid processing stale images
                         imageQueue.clear()
 
-                        // Release old resources
+                        // Resize virtual display instead of recreating (required for Android 16+)
                         mHandler?.post {
                             try {
-                                mVirtualDisplay?.release()
-                                mImageReader?.setOnImageAvailableListener(null, null)
-                                mImageReader?.close()
-                                mImageReader = null
-
-                                // Recreate virtual display with new dimensions
-                                createVirtualDisplay()
+                                resizeVirtualDisplay(currentWidth, currentHeight)
                             } catch (e: Exception) {
-                                Log.e(TAG, "Error recreating virtual display", e)
+                                Log.e(TAG, "Error resizing virtual display", e)
                             }
                         }
                     }
@@ -397,6 +391,46 @@ class MjpegScreenCaptureService: Service() {
             Log.d(TAG, "Orientation monitoring stopped")
         }
         orientationMonitorThread?.start()
+    }
+
+    /**
+     * Resize the virtual display for orientation change.
+     * Android 16+ doesn't allow recreating VirtualDisplay on the same MediaProjection,
+     * so we resize the existing one and update its surface.
+     */
+    private fun resizeVirtualDisplay(metricsWidth: Int, metricsHeight: Int) {
+        val newWidth = metricsWidth / scalingFactor
+        val newHeight = metricsHeight / scalingFactor
+
+        Log.d(TAG, "Resizing virtual display: ${mWidth}x${mHeight} -> ${newWidth}x${newHeight}")
+
+        // Store old ImageReader to close after switching
+        val oldImageReader = mImageReader
+
+        // Remove listener from old ImageReader
+        oldImageReader?.setOnImageAvailableListener(null, null)
+
+        // Create new ImageReader with new dimensions
+        mImageReader = ImageReader.newInstance(newWidth, newHeight, PixelFormat.RGBA_8888, 2)
+
+        // Update stored dimensions
+        mWidth = newWidth
+        mHeight = newHeight
+
+        // Resize the virtual display and update its surface
+        mVirtualDisplay?.resize(newWidth, newHeight, mDensity)
+        mVirtualDisplay?.surface = mImageReader!!.surface
+
+        // Set listener on new ImageReader
+        mImageReader!!.setOnImageAvailableListener(
+            ImageAvailableListener(),
+            mHandler
+        )
+
+        // Close old ImageReader
+        oldImageReader?.close()
+
+        Log.d(TAG, "Virtual display resized successfully")
     }
 
     /**
