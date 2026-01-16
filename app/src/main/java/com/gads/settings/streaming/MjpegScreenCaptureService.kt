@@ -3,10 +3,8 @@ package com.gads.settings.streaming
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Service
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
@@ -16,7 +14,6 @@ import android.media.ImageReader
 import android.media.ImageReader.OnImageAvailableListener
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -24,7 +21,6 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Display
 import android.view.WindowManager
-import com.gads.settings.streaming.NotificationConstants.ORIENTATION_CHANGED_ACTION
 import com.gads.settings.streaming.NotificationUtils.getNotification
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.BlockingQueue
@@ -39,13 +35,21 @@ class MjpegScreenCaptureService: Service() {
     private var mDensity = 0
     private var mWidth = 0
     private var mHeight = 0
-    private var mRotation = 0
 
     private var targetFPS = 15
     private var jpegQuality = 90
     private var scalingFactor = 2
     private var frameIntervalMs = (1000 / targetFPS).toLong()
-    private var configurationChangeReceiver: BroadcastReceiver? = null
+
+    // Image consumer thread
+    private var imageConsumerThread: Thread? = null
+    @Volatile
+    private var isConsumerRunning = false
+
+    // Orientation monitoring (polling approach - reliable on all Android versions)
+    private var orientationMonitorThread: Thread? = null
+    @Volatile
+    private var monitoringOrientation = false
 
     var server: MjpegWebsocketServer? = null
 
@@ -103,6 +107,11 @@ class MjpegScreenCaptureService: Service() {
     }
 
     private fun imageToBitmap(image: Image): Bitmap {
+        // Use actual image dimensions instead of stored mWidth/mHeight
+        // This handles timing issues during rotation
+        val imageWidth = image.width
+        val imageHeight = image.height
+
         // Retrieve the image planes from the image object
         val planes = image.planes
         // Extract the pixel data from the first plane by calling getBuffer() on the first element of the planes array
@@ -113,14 +122,14 @@ class MjpegScreenCaptureService: Service() {
         // distance between adjacent rows in bytes
         val rowStride = planes[0].rowStride
         // Calculate the padding between rows, which is the difference between rowStride and pixelStride multiplied by the image width
-        val rowPadding = rowStride - pixelStride * mWidth
+        val rowPadding = rowStride - pixelStride * imageWidth
 
         // Calculate the initial bitmap width to create a valid image
-        val newWidth = mWidth + (rowPadding / pixelStride)
+        val newWidth = imageWidth + (rowPadding / pixelStride)
 
         // Create the initial bitmap object
         // And copy into it the pixels from the buffer declared above
-        var bitmap = Bitmap.createBitmap(newWidth, mHeight, Bitmap.Config.ARGB_4444)
+        var bitmap = Bitmap.createBitmap(newWidth, imageHeight, Bitmap.Config.ARGB_4444)
         bitmap.copyPixelsFromBuffer(buffer)
 
         // Close the Image to free up memory
@@ -129,7 +138,7 @@ class MjpegScreenCaptureService: Service() {
         // We reinitialize the bitmap object using the original bitmap
         // but with the display width and height
         // essentially cropping it properly
-        bitmap = Bitmap.createBitmap(bitmap, 0, 0, mWidth, mHeight)
+        bitmap = Bitmap.createBitmap(bitmap, 0, 0, imageWidth, imageHeight)
 
         return bitmap
     }
@@ -138,7 +147,7 @@ class MjpegScreenCaptureService: Service() {
 
     inner class ImageConsumer : Runnable {
         override fun run() {
-            while (true) {
+            while (isConsumerRunning) {
                 try {
                     // Take the next image from the queue (this will block if the queue is empty)
                     val bitmap: Bitmap = imageQueue.take()
@@ -197,59 +206,10 @@ class MjpegScreenCaptureService: Service() {
         return null
     }
 
-    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     override fun onCreate() {
         super.onCreate()
 
-        configurationChangeReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                if (ORIENTATION_CHANGED_ACTION.equals(intent.action)) {
-                    imageQueue.clear()
-                    // When orientation changes get the display rotation
-                    val rotation = mDisplay!!.rotation
-                    // If the current rotation is different than the previous rotation
-                    // Re-assign it
-                    if (rotation != mRotation) {
-                        mRotation = rotation
-                        try {
-                            // Clean up the previous virtual display if it exists
-                            if (mVirtualDisplay != null) mVirtualDisplay!!.release()
-
-                            // Start the onImageAvailableListener on the image reader
-                            if (mImageReader != null) mImageReader!!.setOnImageAvailableListener(
-                                null,
-                                null
-                            )
-
-                            // re-create virtual display depending on device width / height
-                            createVirtualDisplay()
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-                    }
-                }
-            }
-        }
-
-        val orientationChangeFilter: IntentFilter = IntentFilter(ORIENTATION_CHANGED_ACTION)
-
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) { // API 26+
-                registerReceiver(
-                    configurationChangeReceiver,
-                    orientationChangeFilter,
-                    Context.RECEIVER_NOT_EXPORTED
-                )
-                Log.d(TAG, "Receiver registered with RECEIVER_NOT_EXPORTED (API 26+).")
-            } else { // API below 26
-                registerReceiver(configurationChangeReceiver, orientationChangeFilter)
-                Log.d(TAG, "Receiver registered without flags (API < 26).")
-            }
-        } catch (e: IllegalArgumentException) {
-            Log.e(TAG, "Error registering receiver: " + e.message)
-        }
-
-        // start capture handling thread
+        // Start capture handling thread
         object : Thread() {
             override fun run() {
                 Looper.prepare()
@@ -260,7 +220,14 @@ class MjpegScreenCaptureService: Service() {
     }
 
     override fun onDestroy() {
-        unregisterReceiver(configurationChangeReceiver)
+        // Stop orientation monitoring
+        stopOrientationMonitoring()
+
+        // Stop the consumer thread
+        isConsumerRunning = false
+        imageConsumerThread?.interrupt()
+        imageConsumerThread = null
+
         super.onDestroy()
     }
 
@@ -318,6 +285,10 @@ class MjpegScreenCaptureService: Service() {
 
     @SuppressLint("WrongConstant")
     private fun createVirtualDisplay() {
+        // Close old ImageReader if it exists
+        mImageReader?.close()
+        mImageReader = null
+
         // We get the real display metrics on the display object
         val metrics = DisplayMetrics()
         mDisplay!!.getRealMetrics(metrics)
@@ -326,10 +297,12 @@ class MjpegScreenCaptureService: Service() {
         // Instead of rescaling bitmaps which reduces quality even further
         val metricsWidth = metrics.widthPixels
         val metricsHeight = metrics.heightPixels
+        mDensity = metrics.densityDpi
 
         mWidth = metricsWidth / scalingFactor
         mHeight = metricsHeight / scalingFactor
-        mDensity = metrics.densityDpi
+
+        Log.d(TAG, "Creating virtual display: ${mWidth}x${mHeight}, metrics: ${metricsWidth}x${metricsHeight}")
 
         // Create an ImageReader object with the proper display dimensions and PixelFormat
         // Couldn't get it to work with any other PixelFormat than RGBA
@@ -346,13 +319,92 @@ class MjpegScreenCaptureService: Service() {
             mHandler
         )
 
-        val imageConsumerThread: Thread = Thread(ImageConsumer())
-        imageConsumerThread.start()
+        // Only start the consumer thread once
+        if (!isConsumerRunning) {
+            isConsumerRunning = true
+            imageConsumerThread = Thread(ImageConsumer())
+            imageConsumerThread?.start()
+        }
 
         // Set an ImageAvailableListener on the ImageReader object
         mImageReader!!.setOnImageAvailableListener(
             ImageAvailableListener(),
             mHandler
         )
+
+        // Start orientation monitoring (only once)
+        if (!monitoringOrientation) {
+            startOrientationMonitoring()
+        }
+    }
+
+    /**
+     * Start orientation monitoring using polling approach.
+     * Polls display metrics every 500ms and recreates virtual display if dimensions change.
+     * This is more reliable than DisplayListener on Android 14+.
+     */
+    private fun startOrientationMonitoring() {
+        val initialMetrics = DisplayMetrics()
+        mDisplay!!.getRealMetrics(initialMetrics)
+        var lastWidth = initialMetrics.widthPixels
+        var lastHeight = initialMetrics.heightPixels
+
+        monitoringOrientation = true
+        orientationMonitorThread = Thread {
+            Log.d(TAG, "Orientation monitoring started (polling every 500ms)")
+
+            while (monitoringOrientation) {
+                try {
+                    Thread.sleep(500)  // Poll every 500ms
+
+                    val metrics = DisplayMetrics()
+                    mDisplay?.getRealMetrics(metrics)
+                    val currentWidth = metrics.widthPixels
+                    val currentHeight = metrics.heightPixels
+
+                    // Check if dimensions changed (rotation occurred)
+                    if (currentWidth != lastWidth || currentHeight != lastHeight) {
+                        Log.d(TAG, "Display size changed: ${lastWidth}x${lastHeight} -> ${currentWidth}x${currentHeight}")
+
+                        lastWidth = currentWidth
+                        lastHeight = currentHeight
+
+                        // Clear the image queue to avoid processing stale images
+                        imageQueue.clear()
+
+                        // Release old resources
+                        mHandler?.post {
+                            try {
+                                mVirtualDisplay?.release()
+                                mImageReader?.setOnImageAvailableListener(null, null)
+                                mImageReader?.close()
+                                mImageReader = null
+
+                                // Recreate virtual display with new dimensions
+                                createVirtualDisplay()
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error recreating virtual display", e)
+                            }
+                        }
+                    }
+                } catch (e: InterruptedException) {
+                    break
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in orientation monitoring", e)
+                }
+            }
+
+            Log.d(TAG, "Orientation monitoring stopped")
+        }
+        orientationMonitorThread?.start()
+    }
+
+    /**
+     * Stop orientation monitoring.
+     */
+    private fun stopOrientationMonitoring() {
+        monitoringOrientation = false
+        orientationMonitorThread?.interrupt()
+        orientationMonitorThread = null
     }
 }
