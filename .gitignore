@@ -1,2 +1,5 @@
 .gradle/*
 .idea/*
+scrcpy/*
+.DS_Store
+DS_Store
