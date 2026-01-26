@@ -4,11 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.MediaCodec
-import android.media.MediaCodecInfo
-import android.media.MediaFormat
 import android.media.projection.MediaProjection
-import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.DisplayMetrics
@@ -17,7 +13,6 @@ import android.view.Surface
 import android.view.WindowManager
 import com.gads.settings.server.utils.EncoderConfig
 import com.gads.settings.server.wrappers.DisplayManagerWrapper
-import java.io.ByteArrayOutputStream
 
 /**
  * Scrcpy-style H.264 screen capture server that can run with or without MediaProjection.
@@ -45,9 +40,10 @@ class H264Server(
     // WebSocket server for broadcasting frames
     private val websocketServer = H264WebSocketServer(1991, this)
 
-    // Encoder components
-    private var mMediaCodec: MediaCodec? = null
-    private var mInputSurface: Surface? = null
+    // H.264 encoder instance
+    private var encoder: H264Encoder? = null
+
+    // Virtual display
     private var mVirtualDisplay: VirtualDisplay? = null
 
     // Display metrics
@@ -61,27 +57,11 @@ class H264Server(
     private var scalingFactor = config.scalingFactor
     private var iFrameInterval = config.iFrameInterval
 
-    // Encoder state
-    @Volatile
-    private var isEncoding = false
-    private var preferredEncoderName: String? = null
-    private var encoderAttempts = 0
-    private val failedEncoders = mutableSetOf<String>()
-    private var firstFrameSent = false
-    private var maxSize = 0 // Track current max resolution for fallback, 0 means no limit
-
-    // SPS/PPS (Sequence Parameter Set / Picture Parameter Set) cache
-    private var cachedSPS: ByteArray? = null
-    private var cachedPPS: ByteArray? = null
-
     // Threading
     private var encoderThread: HandlerThread? = null
     private var encoderHandler: Handler? = null
-    private var encoderOutputThread: Thread? = null
 
     companion object {
-        // Resolution fallback values for encoder failures (in descending order)
-        private val MAX_SIZE_FALLBACK = intArrayOf(2560, 1920, 1600, 1280, 1024, 800)
 
         /**
          * Main entry point for app_process execution (no MediaProjection).
@@ -211,7 +191,7 @@ class H264Server(
      * Get cached SPS/PPS config frames.
      */
     fun getCachedConfigFrames(): Pair<ByteArray?, ByteArray?> {
-        return Pair(cachedSPS, cachedPPS)
+        return encoder?.getCachedConfigFrames() ?: Pair(null, null)
     }
 
     /**
@@ -256,22 +236,8 @@ class H264Server(
 
         // Scale down resolution to reduce encoding load and bandwidth
         // Align to multiples of 16 for hardware encoder compatibility
-        var targetWidth = (metricsWidth / scalingFactor / 16) * 16
-        var targetHeight = (metricsHeight / scalingFactor / 16) * 16
-
-        // Apply maxSize limit if set (for resolution fallback)
-        if (maxSize > 0) {
-            val currentMaxDimension = maxOf(targetWidth, targetHeight)
-            if (currentMaxDimension > maxSize) {
-                val scale = maxSize.toFloat() / currentMaxDimension
-                targetWidth = ((targetWidth * scale).toInt() / 16) * 16
-                targetHeight = ((targetHeight * scale).toInt() / 16) * 16
-                Log.d(TAG, "Applied maxSize limit $maxSize: ${targetWidth}x${targetHeight}")
-            }
-        }
-
-        mWidth = targetWidth
-        mHeight = targetHeight
+        mWidth = (metricsWidth / scalingFactor / 16) * 16
+        mHeight = (metricsHeight / scalingFactor / 16) * 16
         mDensity = metrics.densityDpi
 
         val orientation = if (metricsWidth > metricsHeight) "LANDSCAPE" else "PORTRAIT"
@@ -279,42 +245,35 @@ class H264Server(
         Log.d(TAG, "Display metrics: ${metricsWidth}x${metricsHeight} ($orientation), density: $mDensity")
 
         try {
-            // Create H.264 encoder
-            mMediaCodec = selectEncoder()
+            // Create H.264 encoder with callback
+            encoder = H264Encoder(object : H264Encoder.FrameCallback {
+                override fun onFrameEncoded(data: ByteArray, isKeyFrame: Boolean, pts: Long) {
+                    websocketServer.broadcast(data)
+                }
 
-            // Configure MediaFormat for H.264 video encoding
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, mWidth, mHeight)
-            format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-            format.setInteger(MediaFormat.KEY_FRAME_RATE, targetFPS)
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
+                override fun onEncoderRestartNeeded() {
+                    // Restart encoder after delay
+                    encoderHandler?.postDelayed({
+                        restartEncoder()
+                        // Trigger screen refresh after recovery
+                        encoderHandler?.postDelayed({
+                            triggerScreenRefresh()
+                        }, 200)
+                    }, 500)
+                }
+            })
 
-            // Color range for better color reproduction (API 24+)
-            format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
-
-            // KEY_REPEAT_PREVIOUS_FRAME_AFTER causes crashes on some devices (Xiaomi/Android 15)
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L) // 100ms
+            // Start encoder and get input surface
+            val inputSurface = encoder?.start(mWidth, mHeight, bitrate, targetFPS, iFrameInterval)
+            if (inputSurface == null) {
+                throw RuntimeException("Failed to start encoder")
             }
-
-            // Set actual FPS control (API 29+)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                format.setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, targetFPS.toFloat())
-                Log.d(TAG, "Set max FPS to encoder: $targetFPS")
-            }
-
-            mMediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            mInputSurface = mMediaCodec?.createInputSurface()
-            mMediaCodec?.start()
-
-            // Start encoder output thread
-            startEncoderOutputThread()
 
             // Create VirtualDisplay based on mode
             if (useMediaProjection && mediaProjection != null) {
-                createVirtualDisplayWithMediaProjection()
+                createVirtualDisplayWithMediaProjection(inputSurface)
             } else {
-                createVirtualDisplayWithShellPrivileges()
+                createVirtualDisplayWithShellPrivileges(inputSurface)
             }
 
             Log.d(TAG, "VirtualDisplay and encoder created successfully")
@@ -328,7 +287,7 @@ class H264Server(
     /**
      * Create VirtualDisplay using MediaProjection (Activity mode).
      */
-    private fun createVirtualDisplayWithMediaProjection() {
+    private fun createVirtualDisplayWithMediaProjection(inputSurface: Surface) {
         if (mediaProjection == null) {
             throw IllegalStateException("MediaProjection is null but useMediaProjection=true")
         }
@@ -339,7 +298,7 @@ class H264Server(
             mHeight,
             mDensity,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
-            mInputSurface,
+            inputSurface,
             null,
             encoderHandler
         )
@@ -360,7 +319,7 @@ class H264Server(
      * Simple scrcpy approach: try DisplayManager, fallback to SurfaceControl.
      * Reference: scrcpy ScreenCapture.java lines 127-144
      */
-    private fun createVirtualDisplayWithShellPrivileges() {
+    private fun createVirtualDisplayWithShellPrivileges(inputSurface: Surface) {
         // Try DisplayManager approach (preferred) - scrcpy's simple method
         Log.d(TAG, "Attempting DisplayManager.createVirtualDisplay()...")
         mVirtualDisplay = DisplayManagerWrapper.createVirtualDisplay(
@@ -368,7 +327,7 @@ class H264Server(
             width = mWidth,
             height = mHeight,
             displayIdToMirror = 0,  // Default display
-            surface = mInputSurface!!
+            surface = inputSurface
         )
 
         if (mVirtualDisplay != null) {
@@ -379,14 +338,14 @@ class H264Server(
 
         // Fallback to SurfaceControl
         Log.w(TAG, "DisplayManager failed, trying SurfaceControl...")
-        createVirtualDisplayWithSurfaceControl()
+        createVirtualDisplayWithSurfaceControl(inputSurface)
     }
 
     /**
      * Fallback: Create display using SurfaceControl (lower-level API).
      * This works on older Android versions or when DisplayManager fails.
      */
-    private fun createVirtualDisplayWithSurfaceControl() {
+    private fun createVirtualDisplayWithSurfaceControl(inputSurface: Surface) {
         try {
             val displayToken = com.gads.settings.server.wrappers.SurfaceControlWrapper.createDisplay(
                 "GADSScreenCapture",
@@ -407,7 +366,7 @@ class H264Server(
             com.gads.settings.server.wrappers.SurfaceControlWrapper.openTransaction()
             try {
                 // Set the surface to render to
-                com.gads.settings.server.wrappers.SurfaceControlWrapper.setDisplaySurface(displayToken, mInputSurface!!)
+                com.gads.settings.server.wrappers.SurfaceControlWrapper.setDisplaySurface(displayToken, inputSurface)
 
                 // Set the projection (maps source rect to display rect)
                 val sourceRect = android.graphics.Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
@@ -467,254 +426,6 @@ class H264Server(
         }
     }
 
-    /**
-     * Select the best available H.264 encoder with fallback logic.
-     * Pattern from H264ScreenCaptureService.kt lines 534-594.
-     */
-    private fun selectEncoder(): MediaCodec {
-        val manufacturer = Build.MANUFACTURER.lowercase()
-        val isProblematicDevice = manufacturer.contains("xiaomi") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM
-
-        // If we've already found a working encoder, use it
-        if (preferredEncoderName != null && !failedEncoders.contains(preferredEncoderName)) {
-            try {
-                Log.d(TAG, "Using previously successful encoder: $preferredEncoderName")
-                return MediaCodec.createByCodecName(preferredEncoderName!!)
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to create preferred encoder $preferredEncoderName: ${e.message}")
-                failedEncoders.add(preferredEncoderName!!)
-                preferredEncoderName = null
-            }
-        }
-
-        // List of encoders to try in order of preference
-        val encodersToTry = if (isProblematicDevice) {
-            Log.d(TAG, "Detected problematic device (Xiaomi Android 15+), preferring software encoder")
-            listOf("c2.android.avc.encoder", "OMX.google.h264.encoder", null)
-        } else {
-            listOf(null, "c2.android.avc.encoder", "OMX.google.h264.encoder")
-        }
-
-        for (encoderName in encodersToTry) {
-            val codecToTry = if (encoderName == null) {
-                try {
-                    val defaultCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                    if (failedEncoders.contains(defaultCodec.name)) {
-                        Log.d(TAG, "Skipping previously failed encoder: ${defaultCodec.name}")
-                        defaultCodec.release()
-                        continue
-                    }
-                    defaultCodec.name
-                } catch (e: Exception) {
-                    continue
-                }
-            } else {
-                if (failedEncoders.contains(encoderName)) {
-                    Log.d(TAG, "Skipping previously failed encoder: $encoderName")
-                    continue
-                }
-                encoderName
-            }
-
-            try {
-                val codec = MediaCodec.createByCodecName(codecToTry)
-                Log.d(TAG, "Successfully created encoder: ${codec.name}")
-                preferredEncoderName = codec.name
-                return codec
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to create encoder $codecToTry: ${e.message}")
-                failedEncoders.add(codecToTry)
-            }
-        }
-
-        throw RuntimeException("No suitable H.264 encoder found (tried ${failedEncoders.size} encoders)")
-    }
-
-    /**
-     * Start encoder output thread that reads H.264 frames and broadcasts to WebSocket.
-     * Pattern from H264ScreenCaptureService.kt lines 172-344.
-     */
-    private fun startEncoderOutputThread() {
-        isEncoding = true
-        encoderOutputThread = Thread {
-            // Some devices (Meizu) deadlock if the video encoding thread has no Looper
-            android.os.Looper.prepare()
-
-            val bufferInfo = MediaCodec.BufferInfo()
-            var consecutiveErrors = 0
-            val maxConsecutiveErrors = 5
-
-            Log.d(TAG, "Encoder output thread started")
-
-            while (isEncoding && !Thread.currentThread().isInterrupted) {
-                try {
-                    // Use timeout to allow thread interruption (1 second)
-                    val outputBufferIndex = mMediaCodec?.dequeueOutputBuffer(bufferInfo, 1000000) ?: -1
-
-                    when {
-                        // MediaCodec signals format changed, extract SPS/PPS
-                        outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            val newFormat = mMediaCodec?.outputFormat
-                            val sps = newFormat?.getByteBuffer("csd-0")
-                            val pps = newFormat?.getByteBuffer("csd-1")
-
-                            if (sps != null) {
-                                cachedSPS = ByteArray(sps.remaining())
-                                sps.get(cachedSPS!!)
-                                Log.d(TAG, "SPS extracted: ${cachedSPS!!.size} bytes")
-                            }
-
-                            if (pps != null) {
-                                cachedPPS = ByteArray(pps.remaining())
-                                pps.get(cachedPPS!!)
-                                Log.d(TAG, "PPS extracted: ${cachedPPS!!.size} bytes")
-                            }
-                        }
-
-                        // Valid output buffer with encoded frame data
-                        outputBufferIndex >= 0 -> {
-                            val encodedData = mMediaCodec?.getOutputBuffer(outputBufferIndex)
-
-                            // Reset attempt counter on successful frame
-                            if (encoderAttempts > 0) {
-                                encoderAttempts = 0
-                            }
-
-                            if (encodedData != null && bufferInfo.size > 0) {
-                                encodedData.position(bufferInfo.offset)
-                                encodedData.limit(bufferInfo.offset + bufferInfo.size)
-
-                                val data = ByteArray(bufferInfo.size)
-                                encodedData.get(data)
-
-                                val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-                                val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-
-                                if (!isConfig) {
-                                    firstFrameSent = true
-                                    consecutiveErrors = 0
-                                }
-
-                                if (data.isNotEmpty()) {
-                                    val outputStream = ByteArrayOutputStream()
-
-                                    // Write 8-byte PTS timestamp (big-endian)
-                                    val pts = bufferInfo.presentationTimeUs
-                                    outputStream.write(byteArrayOf(
-                                        (pts shr 56).toByte(),
-                                        (pts shr 48).toByte(),
-                                        (pts shr 40).toByte(),
-                                        (pts shr 32).toByte(),
-                                        (pts shr 24).toByte(),
-                                        (pts shr 16).toByte(),
-                                        (pts shr 8).toByte(),
-                                        pts.toByte()
-                                    ))
-
-                                    // Prepend SPS/PPS to I-frames
-                                    if (isKeyFrame && cachedSPS != null && cachedPPS != null) {
-                                        outputStream.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
-                                        outputStream.write(cachedSPS)
-                                        outputStream.write(byteArrayOf(0x00, 0x00, 0x00, 0x01))
-                                        outputStream.write(cachedPPS)
-                                        outputStream.write(data)
-
-                                        websocketServer.broadcast(outputStream.toByteArray())
-                                        Log.d(TAG, "Sent I-frame with PTS=$pts and SPS/PPS (${outputStream.size()} bytes)")
-                                    } else {
-                                        // P-frames
-                                        outputStream.write(data)
-                                        websocketServer.broadcast(outputStream.toByteArray())
-                                    }
-                                }
-                            }
-
-                            mMediaCodec?.releaseOutputBuffer(outputBufferIndex, false)
-                        }
-                    }
-
-                } catch (e: InterruptedException) {
-                    Log.d(TAG, "Encoder output thread interrupted, exiting")
-                    break
-                } catch (e: Exception) {
-                    consecutiveErrors++
-                    Log.e(TAG, "Error in encoder output thread ($consecutiveErrors/$maxConsecutiveErrors): ${e.message}")
-
-                    if (consecutiveErrors >= maxConsecutiveErrors) {
-                        Log.e(TAG, "Encoder crashed after $consecutiveErrors consecutive errors")
-
-                        // Try resolution fallback before first frame
-                        if (!firstFrameSent) {
-                            val newMaxSize = chooseMaxSizeFallback(mWidth, mHeight)
-                            if (newMaxSize > 0) {
-                                Log.w(TAG, "Retrying with reduced resolution: max dimension = $newMaxSize")
-                                maxSize = newMaxSize
-                                consecutiveErrors = 0
-
-                                encoderHandler?.post {
-                                    releaseEncoder()
-                                }
-                                encoderHandler?.postDelayed({
-                                    createVirtualDisplay()
-                                    // Trigger screen refresh after recovery
-                                    encoderHandler?.postDelayed({
-                                        triggerScreenRefresh()
-                                    }, 200)
-                                }, 500)
-                                break
-                            }
-                            Log.w(TAG, "No resolution fallback available, trying different encoder")
-                        }
-
-                        // Try different encoder
-                        preferredEncoderName?.let {
-                            Log.w(TAG, "Marking encoder as failed: $it")
-                            failedEncoders.add(it)
-                        }
-
-                        if (encoderAttempts < 2) {
-                            Log.w(TAG, "Attempting to restart with alternative encoder (attempt ${encoderAttempts + 1})")
-                            preferredEncoderName = null
-                            encoderAttempts++
-
-                            encoderHandler?.post {
-                                releaseEncoder()
-                            }
-                            encoderHandler?.postDelayed({
-                                createVirtualDisplay()
-                                // Trigger screen refresh after recovery
-                                encoderHandler?.postDelayed({
-                                    triggerScreenRefresh()
-                                }, 200)
-                            }, 500)
-                        }
-                        break
-                    }
-
-                    Thread.sleep(100)
-                }
-            }
-
-            Log.d(TAG, "Encoder output thread stopped")
-        }
-        encoderOutputThread?.start()
-    }
-
-    /**
-     * Choose next smaller resolution from fallback list for encoder retry.
-     * Pattern from H264ScreenCaptureService.kt lines 155-167.
-     */
-    private fun chooseMaxSizeFallback(currentWidth: Int, currentHeight: Int): Int {
-        val currentMaxSize = maxOf(currentWidth, currentHeight)
-        for (value in MAX_SIZE_FALLBACK) {
-            if (value < currentMaxSize) {
-                Log.d(TAG, "Choosing fallback resolution: max dimension = $value (current: $currentMaxSize)")
-                return value
-            }
-        }
-        Log.d(TAG, "No resolution fallback available for ${currentWidth}x${currentHeight}")
-        return 0
-    }
 
     /**
      * Start orientation monitoring.
@@ -791,28 +502,9 @@ class H264Server(
             // Stop orientation monitoring first to prevent it from triggering another restart
             stopOrientationMonitoring()
 
-            // Signal encoder output thread to stop
-            isEncoding = false
-
-            // Wait for encoder output thread to fully stop before releasing resources
-            // This prevents race conditions when restarting the encoder
-            encoderOutputThread?.let { thread ->
-                if (thread.isAlive) {
-                    Log.d(TAG, "Waiting for encoder output thread to stop...")
-                    thread.interrupt()
-                    try {
-                        thread.join(2000) // Wait up to 2 seconds
-                        if (thread.isAlive) {
-                            Log.w(TAG, "Encoder output thread did not stop in time")
-                        } else {
-                            Log.d(TAG, "Encoder output thread stopped successfully")
-                        }
-                    } catch (e: InterruptedException) {
-                        Log.w(TAG, "Interrupted while waiting for encoder thread to stop")
-                    }
-                }
-            }
-            encoderOutputThread = null
+            // Release the encoder
+            encoder?.release()
+            encoder = null
 
             // Release VirtualDisplay (if using DisplayManager approach)
             mVirtualDisplay?.release()
@@ -828,25 +520,6 @@ class H264Server(
                 }
             }
             surfaceControlDisplay = null
-
-            // Stop and release MediaCodec (wrapped in try-catch for robustness)
-            try {
-                mMediaCodec?.stop()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error stopping MediaCodec: ${e.message}")
-            }
-
-            try {
-                mMediaCodec?.release()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error releasing MediaCodec: ${e.message}")
-            }
-            mMediaCodec = null
-
-            mInputSurface?.release()
-            mInputSurface = null
-
-            firstFrameSent = false
 
             Log.d(TAG, "Encoder released")
         } catch (e: Exception) {
