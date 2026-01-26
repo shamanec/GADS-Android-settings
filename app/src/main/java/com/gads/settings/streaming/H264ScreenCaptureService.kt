@@ -18,7 +18,6 @@ import android.os.IBinder
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Display
-import android.view.Surface
 import android.view.WindowManager
 import com.gads.settings.server.H264Encoder
 import com.gads.settings.streaming.NotificationUtils.getNotification
@@ -59,14 +58,14 @@ class H264ScreenCaptureService: Service() {
     private var encoderThread: HandlerThread? = null
     private var encoderHandler: Handler? = null
 
-    var server: H264WebsocketServer? = null
+    var server: H264WebSocketServer? = null
 
     val TAG: String = "GADS H264"
 
     init {
         Log.d(TAG, "Service init block started")
         try {
-            server = H264WebsocketServer(1991, this)
+            server = H264WebSocketServer(1991, this)
             server?.isReuseAddr = true
             server?.start()
             Log.d(TAG, "WebSocket server started successfully on port 1991")

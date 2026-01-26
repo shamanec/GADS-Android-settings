@@ -62,6 +62,11 @@ class H264Server(
     private var encoderHandler: Handler? = null
 
     companion object {
+        // Timing constants for encoder lifecycle management
+        private const val ENCODER_RESTART_DELAY_MS = 500L // Delay to ensure MediaCodec resources are fully released
+        private const val SCREEN_REFRESH_DELAY_MS = 200L // Delay for encoder to be ready before triggering refresh
+        private const val TOTAL_RESTART_REFRESH_DELAY_MS = ENCODER_RESTART_DELAY_MS + SCREEN_REFRESH_DELAY_MS // Total delay for restart + refresh
+        private const val ORIENTATION_POLL_INTERVAL_MS = 500L // Polling interval for orientation changes
 
         /**
          * Main entry point for app_process execution (no MediaProjection).
@@ -136,6 +141,10 @@ class H264Server(
         Log.d(TAG, "Stopping H264Server...")
 
         stopOrientationMonitoring()
+
+        // Cancel any pending restart operations and reset the flag
+        isRestarting = false
+        encoderHandler?.removeCallbacksAndMessages(null)
 
         encoderHandler?.post {
             releaseEncoder()
@@ -212,14 +221,31 @@ class H264Server(
      * Restart the encoder (e.g., for orientation change or config change).
      */
     fun restartEncoder() {
+        // Prevent concurrent restarts (race condition during rapid orientation changes)
+        if (isRestarting) {
+            Log.d(TAG, "Restart already in progress, ignoring")
+            return
+        }
+
+        isRestarting = true
+        Log.d(TAG, "Starting encoder restart")
+
+        // Cancel any pending createVirtualDisplay tasks to prevent multiple instances
+        encoderHandler?.removeCallbacksAndMessages(null)
+
         encoderHandler?.post {
             releaseEncoder()
         }
         // Add delay to ensure MediaCodec native resources are fully released
         // before creating new encoder (prevents Error 0xffffffe0)
         encoderHandler?.postDelayed({
-            createVirtualDisplay()
-        }, 500) // 500ms delay - increased to give more time for cleanup after multiple restarts
+            try {
+                createVirtualDisplay()
+            } finally {
+                isRestarting = false
+                Log.d(TAG, "Encoder restart complete")
+            }
+        }, ENCODER_RESTART_DELAY_MS)
     }
 
     /**
@@ -252,14 +278,12 @@ class H264Server(
                 }
 
                 override fun onEncoderRestartNeeded() {
-                    // Restart encoder after delay
+                    // restartEncoder() already includes proper delays and guards
+                    restartEncoder()
+                    // Trigger screen refresh after recovery
                     encoderHandler?.postDelayed({
-                        restartEncoder()
-                        // Trigger screen refresh after recovery
-                        encoderHandler?.postDelayed({
-                            triggerScreenRefresh()
-                        }, 200)
-                    }, 500)
+                        triggerScreenRefresh()
+                    }, TOTAL_RESTART_REFRESH_DELAY_MS)
                 }
             })
 
@@ -313,6 +337,10 @@ class H264Server(
     private var orientationMonitorThread: Thread? = null
     @Volatile
     private var monitoringOrientation = false
+
+    // Restart guard to prevent race conditions
+    @Volatile
+    private var isRestarting = false
 
     /**
      * Create VirtualDisplay using hidden APIs (app_process mode).
@@ -443,11 +471,11 @@ class H264Server(
 
         monitoringOrientation = true
         orientationMonitorThread = Thread {
-            Log.d(TAG, "Orientation monitoring started (polling every 500ms)")
+            Log.d(TAG, "Orientation monitoring started (polling every ${ORIENTATION_POLL_INTERVAL_MS}ms)")
 
             while (monitoringOrientation) {
                 try {
-                    Thread.sleep(500)  // Poll every 500ms
+                    Thread.sleep(ORIENTATION_POLL_INTERVAL_MS)
 
                     val metrics = getDisplayMetrics()
                     val currentWidth = metrics?.widthPixels ?: lastWidth
@@ -461,16 +489,13 @@ class H264Server(
                         lastWidth = currentWidth
                         lastHeight = currentHeight
 
-                        encoderHandler?.post {
-                            releaseEncoder()
-                        }
+                        // Use restartEncoder() to benefit from race condition protection
+                        restartEncoder()
+
+                        // Trigger screen refresh after encoder restart to get immediate frame
                         encoderHandler?.postDelayed({
-                            createVirtualDisplay()
-                            // Trigger screen refresh after encoder restart to get immediate frame
-                            encoderHandler?.postDelayed({
-                                triggerScreenRefresh()
-                            }, 200) // Wait 200ms for encoder to be ready
-                        }, 500)
+                            triggerScreenRefresh()
+                        }, TOTAL_RESTART_REFRESH_DELAY_MS)
                     }
                 } catch (e: InterruptedException) {
                     break

@@ -54,6 +54,12 @@ class H264Encoder(
     companion object {
         // Resolution fallback values for encoder failures (in descending order)
         private val MAX_SIZE_FALLBACK = intArrayOf(2560, 1920, 1600, 1280, 1024, 800)
+
+        // Timing constants for encoder thread management
+        private const val ENCODER_THREAD_STOP_TIMEOUT_MS = 2000L // Max wait time for encoder thread to stop
+        private const val OUTPUT_BUFFER_TIMEOUT_US = 1000000L // Timeout for dequeueOutputBuffer (1 second in microseconds)
+        private const val ERROR_RETRY_DELAY_MS = 100L // Delay between error retries
+        private const val REPEAT_FRAME_TIMEOUT_US = 100_000L // Repeat previous frame after this timeout (100ms in microseconds)
     }
 
     /**
@@ -124,7 +130,7 @@ class H264Encoder(
 
             // KEY_REPEAT_PREVIOUS_FRAME_AFTER causes crashes on some devices (Xiaomi/Android 15)
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L) // 100ms
+                format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, REPEAT_FRAME_TIMEOUT_US)
             }
 
             // Set actual FPS control (API 29+)
@@ -164,7 +170,7 @@ class H264Encoder(
                     Log.d(TAG, "Waiting for encoder output thread to stop...")
                     thread.interrupt()
                     try {
-                        thread.join(2000) // Wait up to 2 seconds
+                        thread.join(ENCODER_THREAD_STOP_TIMEOUT_MS)
                         if (thread.isAlive) {
                             Log.w(TAG, "Encoder output thread did not stop in time")
                         } else {
@@ -302,8 +308,8 @@ class H264Encoder(
 
             while (isEncoding && !Thread.currentThread().isInterrupted) {
                 try {
-                    // Use timeout to allow thread interruption (1 second)
-                    val outputBufferIndex = mediaCodec?.dequeueOutputBuffer(bufferInfo, 1000000) ?: -1
+                    // Use timeout to allow thread interruption
+                    val outputBufferIndex = mediaCodec?.dequeueOutputBuffer(bufferInfo, OUTPUT_BUFFER_TIMEOUT_US) ?: -1
 
                     when {
                         // MediaCodec signals format changed, extract SPS/PPS
@@ -429,7 +435,7 @@ class H264Encoder(
                         break
                     }
 
-                    Thread.sleep(100)
+                    Thread.sleep(ERROR_RETRY_DELAY_MS)
                 }
             }
 

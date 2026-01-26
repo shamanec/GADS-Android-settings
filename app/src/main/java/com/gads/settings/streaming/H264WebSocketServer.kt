@@ -11,7 +11,7 @@ import java.nio.ByteBuffer
 //
 // On client connection, immediately sends cached SPS/PPS config frames so decoders can start processing.
 // Supports runtime configuration via text messages for FPS, bitrate, scaling, and I-frame interval.
-class H264WebsocketServer(port: Int, private val screenCaptureService: H264ScreenCaptureService): org.java_websocket.server.WebSocketServer(InetSocketAddress(port)) {
+class H264WebSocketServer(port: Int, private val screenCaptureService: H264ScreenCaptureService): org.java_websocket.server.WebSocketServer(InetSocketAddress(port)) {
     private val TAG = "GADS H264 server"
 
     // Called when a new client connects to the WebSocket server.
