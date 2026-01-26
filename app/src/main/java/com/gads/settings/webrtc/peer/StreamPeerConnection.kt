@@ -244,6 +244,7 @@ class StreamPeerConnection(
    */
   override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
     Log.d(TAG, "[onIceConnectionChange] #sfu; #$typeTag; newState: $newState")
+    newState?.let { onIceConnectionChange?.invoke(it) }
     when (newState) {
       PeerConnection.IceConnectionState.CLOSED,
       PeerConnection.IceConnectionState.FAILED,
