@@ -23,6 +23,24 @@
 -dontwarn java.lang.management.ManagementFactory
 -dontwarn java.lang.management.RuntimeMXBean
 -dontwarn org.slf4j.impl.StaticLoggerBinder
+
+# Keep RemoteControlServer for app_process execution
 -keep class com.gads.settings.RemoteControlServerKt { *; }
 -keep class com.gads.settings.RemoteControlServer { *; }
 -keep class com.gads.settings.InputInjector { *; }
+
+# Keep H264Server for app_process execution
+-keep class com.gads.settings.server.H264Server {
+    public static void main(java.lang.String[]);
+}
+-keep class com.gads.settings.server.H264Server { *; }
+-keep class com.gads.settings.server.** { *; }
+
+# Keep reflection targets (hidden Android APIs)
+-keep class android.os.ServiceManager { *; }
+-keep class android.hardware.display.DisplayManagerGlobal { *; }
+-keep class android.hardware.display.IDisplayManager { *; }
+-keep class android.hardware.display.IDisplayManager$Stub { *; }
+-keep class android.view.SurfaceControl { *; }
+-keep class android.media.projection.IMediaProjection { *; }
+-keep class android.hardware.display.IVirtualDisplayCallback { *; }

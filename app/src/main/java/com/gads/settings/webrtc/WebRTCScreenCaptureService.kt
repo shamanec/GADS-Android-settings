@@ -4,6 +4,12 @@ import android.app.Notification
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.hardware.display.DisplayManager
+import android.hardware.SensorManager
+import android.view.Display
+import android.view.OrientationEventListener
+import android.view.Surface
+import android.media.MediaCodecList
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Handler
@@ -11,8 +17,6 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.DisplayMetrics
 import android.util.Log
-import android.view.OrientationEventListener
-import android.view.Surface.ROTATION_0
 import android.view.WindowManager
 import androidx.core.util.Pair
 import com.gads.settings.webrtc.peer.StreamPeerConnection
@@ -37,6 +41,7 @@ import org.webrtc.RtpTransceiver
 import org.webrtc.CapturerObserver
 import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SessionDescription
+import org.webrtc.VideoCapturer
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoSource
 import org.webrtc.VideoFrame
@@ -54,13 +59,17 @@ class WebRTCScreenCaptureService : Service() {
 
     // Projection properties
     private var projectionIntent: Intent? = null
-    private var orientationEventListener: OrientationEventListener? = null
-    private var lastKnownRotation: Int = ROTATION_0  // default
+
+    // Orientation listener uses accelerometer - never misses rotation events
+    private var orientationListener: OrientationEventListener? = null
+    private var lastKnownRotation: Int = -1
 
     // Screen metrics
     private var metrics: DisplayMetrics = DisplayMetrics()
     private var streamWidth: Int = 0
     private var streamHeight: Int = 0
+    private var baseWidth: Int = 0   // Portrait width (smaller dimension)
+    private var baseHeight: Int = 0  // Portrait height (larger dimension)
 
     // Session and connection
     private lateinit var offer: SessionDescription
@@ -69,7 +78,7 @@ class WebRTCScreenCaptureService : Service() {
     private val sessionManagerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     // Screen and video
-    private lateinit var screenCapturer: ScreenCapturerAndroid
+    private lateinit var screenCapturer: VideoCapturer
     private lateinit var videoSource: VideoSource
     private lateinit var localVideoTrack: VideoTrack
     private val _localVideoTrackFlow = MutableSharedFlow<VideoTrack>()
@@ -96,6 +105,58 @@ class WebRTCScreenCaptureService : Service() {
 
     // FPS constant
     private val TARGET_FPS = 30
+
+    // Hysteresis to avoid flutter without misaligning with Android system thresholds
+    private val HYSTERESIS_DEGREES = 15
+
+    private val SENSOR_DEBOUNCE_MS = 100L
+    private val MAX_DEBOUNCE_WAIT_MS = 500L
+    private val SYSTEM_ROTATION_TIMEOUT_MS = 450L
+
+    private var pendingRotation: Int = -1
+    private var lastStableOrientation: Int = -1
+    private var orientationStableSince: Long = 0
+    private var debounceStartTime: Long = 0
+    private var rotationTimeoutRunnable: Runnable? = null
+
+    // Encoder reconfiguration callback (cancelable for rapid rotations)
+    private var encoderReconfigRunnable: Runnable? = null
+
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId != Display.DEFAULT_DISPLAY || !isCaptureRunning) return
+
+            sessionManagerScope.launch {
+                captureMutex.withLock {
+                    val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
+                    val display = displayManager.getDisplay(displayId) ?: return@withLock
+                    val systemRotation = display.rotation
+
+                    cancelRotationTimeout()
+
+                    lastStableOrientation = systemRotation
+                    orientationStableSince = 0
+                    debounceStartTime = 0
+
+                    when {
+                        pendingRotation != -1 && systemRotation == pendingRotation -> {
+                            logBuffer("DisplayListener: System confirmed ${rotationToString(systemRotation)}")
+                            applyRotationLocked(systemRotation)
+                        }
+                        systemRotation != lastKnownRotation -> {
+                            logBuffer("DisplayListener: External rotation to ${rotationToString(systemRotation)}")
+                            applyRotationLocked(systemRotation)
+                        }
+                        else -> {
+                            logBuffer("DisplayListener: No change (${rotationToString(systemRotation)})")
+                        }
+                    }
+                }
+            }
+        }
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+    }
 
     // Debug timing
     private var serviceStartTime = 0L
@@ -149,6 +210,39 @@ class WebRTCScreenCaptureService : Service() {
         private fun isStopCommand(intent: Intent): Boolean {
             return intent.hasExtra("ACTION") && intent.getStringExtra("ACTION") == "STOP"
         }
+
+        /**
+         * Detect if device uses Qualcomm hardware encoder.
+         * Qualcomm encoders have prefix "OMX.qcom." or "c2.qti."
+         * These encoders need longer delay for SPS/PPS generation due to low-latency optimization.
+         */
+        private fun isQualcommFastEncoder(): Boolean {
+            return try {
+                val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+                codecList.codecInfos.any { codecInfo ->
+                    codecInfo.isEncoder &&
+                    (codecInfo.name.startsWith("OMX.qcom.") || codecInfo.name.startsWith("c2.qti."))
+                }
+            } catch (e: Exception) {
+                // Fallback: assume not Qualcomm
+                false
+            }
+        }
+
+        /**
+         * Get encoder ready delay based on chipset.
+         * Qualcomm encoders are optimized for low-latency gaming (240fps),
+         * which means they start processing immediately - before SPS/PPS
+         * generation is complete. Exynos/Mali encoders have deeper pipelines
+         * and naturally wait longer.
+         */
+        private fun getEncoderReadyDelay(): Long {
+            return if (isQualcommFastEncoder()) {
+                300L  // Qualcomm encoders need longer delay for SPS/PPS generation (300ms tested insufficient)
+            } else {
+                100L  // Other devices (Exynos, older Snapdragon)
+            }
+        }
     }
 
     init {
@@ -172,26 +266,89 @@ class WebRTCScreenCaptureService : Service() {
             }
         }.start()
 
-        orientationEventListener = object : OrientationEventListener(
-            this,
-            android.hardware.SensorManager.SENSOR_DELAY_NORMAL
-        ) {
+        // Register orientation listener for reliable rotation detection
+        orientationListener = object : OrientationEventListener(this, SensorManager.SENSOR_DELAY_NORMAL) {
             override fun onOrientationChanged(orientation: Int) {
-                if (orientation == ORIENTATION_UNKNOWN) return
+                if (orientation == ORIENTATION_UNKNOWN || !isCaptureRunning) return
 
-                val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-                val rotation = wm.defaultDisplay.rotation
+                val now = System.currentTimeMillis()
 
-                if (rotation != lastKnownRotation) {
-                    Log.d(TAG_BUFFER, "Orientation changed: $lastKnownRotation -> $rotation")
-                    lastKnownRotation = rotation
-                    updateCaptureResolution()
+                // Calculate expected rotation using AOSP formula
+                val nearestRotation = when (((orientation + 45) / 90) % 4) {
+                    0 -> Surface.ROTATION_0     // 315-45 -> PORTRAIT
+                    1 -> Surface.ROTATION_270   // 45-135 -> LANDSCAPE_INVERTED
+                    2 -> Surface.ROTATION_180   // 135-225 -> PORTRAIT_INVERTED
+                    3 -> Surface.ROTATION_90    // 225-315 -> LANDSCAPE
+                    else -> lastKnownRotation
+                }
+
+                // Skip if same as current rotation
+                if (nearestRotation == lastKnownRotation && pendingRotation == -1) return
+
+                // Skip if this orientation was already rejected (app doesn't support it)
+                if (nearestRotation == lastStableOrientation && nearestRotation != lastKnownRotation) return
+
+                // Debounce: ensure orientation is stable before acting
+                if (nearestRotation == lastStableOrientation) {
+                    // Same as last stable reading - check if stable long enough
+                    if (now - orientationStableSince >= SENSOR_DEBOUNCE_MS) {
+                        // Stable long enough - proceed with rotation check
+                    } else {
+                        // Not stable long enough yet
+                        return
+                    }
+                } else {
+                    // Different orientation - start new stability timer
+                    lastStableOrientation = nearestRotation
+                    orientationStableSince = now
+
+                    // If no pending rotation yet, start debounce wait
+                    if (debounceStartTime == 0L) {
+                        debounceStartTime = now
+                    }
+                    return
+                }
+
+                // Max debounce wait exceeded - force processing
+                if (debounceStartTime > 0 && now - debounceStartTime >= MAX_DEBOUNCE_WAIT_MS) {
+                    logBuffer("Max debounce wait exceeded, forcing rotation check")
+                }
+
+                // Handle fast rotation: update pending target if user rotated again
+                if (pendingRotation != -1) {
+                    if (pendingRotation != nearestRotation) {
+                        logBuffer("Fast rotation: updating pending ${rotationToString(pendingRotation)} -> ${rotationToString(nearestRotation)}")
+                        pendingRotation = nearestRotation
+                        scheduleRotationTimeout()
+                    }
+                    return
+                }
+
+                // Apply hysteresis to avoid flutter
+                val currentCenter = when (lastKnownRotation) {
+                    Surface.ROTATION_0 -> 0
+                    Surface.ROTATION_270 -> 90
+                    Surface.ROTATION_180 -> 180
+                    Surface.ROTATION_90 -> 270
+                    else -> 0
+                }
+
+                val distance = minOf(
+                    kotlin.math.abs(orientation - currentCenter),
+                    360 - kotlin.math.abs(orientation - currentCenter)
+                )
+
+                if (distance > 45 + HYSTERESIS_DEGREES) {
+                    // Set pending rotation and schedule timeout
+                    // DisplayListener will confirm or timeout will apply
+                    logBuffer("Sensor detected: ${orientation}° -> ${rotationToString(nearestRotation)}, waiting for system...")
+                    pendingRotation = nearestRotation
+                    debounceStartTime = now
+                    scheduleRotationTimeout()
                 }
             }
         }
-
-        // Enable listening to orientation changes
-        orientationEventListener?.enable()
+        orientationListener?.enable()
     }
 
     // The onStartCommand() method is called by the Android system when the service is started
@@ -230,8 +387,20 @@ class WebRTCScreenCaptureService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // Disable the orientation listener to prevent leaks
-        orientationEventListener?.disable()
+        // Disable orientation listener to prevent leaks
+        orientationListener?.disable()
+        orientationListener = null
+
+        // Unregister display listener
+        try {
+            val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
+            displayManager.unregisterDisplayListener(displayListener)
+        } catch (e: Exception) {
+            Log.e(TAG_BUFFER, "Failed to unregister DisplayListener: ${e.message}")
+        }
+
+        // Cancel any pending rotation timeout
+        cancelRotationTimeout()
 
         // Cleanup capture when service is destroyed
         if (isCaptureRunning) {
@@ -252,23 +421,24 @@ class WebRTCScreenCaptureService : Service() {
         val sdp = offerJson.getString("sdp")
         offer = SessionDescription(SessionDescription.Type.OFFER, sdp)
 
-        // Start the projection if we currently don't have a peerConnection
-        // This is needed because we close the peer connection on disconnect of the client
-        if (peerConnection == null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                // Android 14+: Capture should already be running (started in onStartCommand)
-                if (!isCaptureRunning) {
-                    if (projectionNeedsReauthorization) {
-                        logBuffer("Projection invalidated, triggering re-authorization")
-                        triggerReauthorization()
-                        return
-                    }
-                    Log.e(TAG_BUFFER, "Cannot handle offer - capture not running on Android 14+")
+        // Ensure capture is running before handling the offer
+        // Android 13-: Check isCaptureRunning directly (handles race condition with hangup coroutine)
+        // Android 14+: Capture should already be running (started in onStartCommand)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            if (!isCaptureRunning && projectionIntent != null) {
+                logBuffer("Android 13-: Restarting capture (was stopped)")
+                startProjection(projectionIntent)
+            }
+        } else {
+            // Android 14+: Capture must be running, cannot restart (one-time-use token)
+            if (!isCaptureRunning) {
+                if (projectionNeedsReauthorization) {
+                    logBuffer("Projection invalidated, triggering re-authorization")
+                    triggerReauthorization()
                     return
                 }
-            } else {
-                // Android 13-: Original behavior
-                startProjection(projectionIntent)
+                Log.e(TAG_BUFFER, "Cannot handle offer - capture not running on Android 14+")
+                return
             }
         }
 
@@ -346,8 +516,8 @@ class WebRTCScreenCaptureService : Service() {
 
                 // Update encoding parameters
                 parameters.encodings?.forEach { encoding ->
-                    encoding.maxBitrateBps = 1_000_000
-                    encoding.minBitrateBps = 5_000_000
+                    encoding.minBitrateBps = 1_000_000
+                    encoding.maxBitrateBps = 5_000_000
                     encoding.maxFramerate = 30
 
                     // Enable scalability for better adaptation
@@ -529,47 +699,245 @@ class WebRTCScreenCaptureService : Service() {
     }
 
     /**
-     * Update the screen capture resolution when orientation changes.
+     * Force encoder reconfiguration after resolution change.
      *
-     * Strategy:
-     * - Android 13 and below: Use changeCaptureFormat() to update resolution
-     * - Android 14+: Only update VideoSource adapter, don't touch capture
+     * Creates a NEW VideoTrack with the same source to force complete encoder reset,
+     * which guarantees new SPS/PPS headers with correct resolution.
      *
-     * On Android 14+, changeCaptureFormat() would kill MediaProjection.
-     * Instead, we rely on VideoSource.adaptOutputFormat() which only affects
-     * the output pipeline, not the capture.
+     * Note: setTrack(null) disposes the track, so we must create a new one.
      */
-    private fun updateCaptureResolution() {
+    private fun forceEncoderReconfiguration() {
+        val pc = peerConnection?.connection ?: return
+
+        val videoSender = pc.senders.find {
+            it.track()?.kind() == MediaStreamTrack.VIDEO_TRACK_KIND
+        } ?: run {
+            logBuffer("No video sender found for encoder reconfiguration")
+            return
+        }
+
+        try {
+            if (!::videoSource.isInitialized) {
+                logBuffer("VideoSource not initialized, skipping encoder reconfiguration")
+                return
+            }
+
+            logBuffer("Encoder reset: creating new track with dimensions ${streamWidth}x${streamHeight}")
+
+            // Create NEW track with same source (this forces encoder reset)
+            val newTrack = peerConnectionFactory.makeVideoTrack(
+                source = videoSource,
+                trackId = "ScreenTrack${UUID.randomUUID()}"
+            )
+            newTrack.setEnabled(true)
+
+            // Replace track in sender (this triggers encoder reconfiguration)
+            videoSender.setTrack(newTrack, false)
+            logBuffer("Encoder reset: new track attached")
+
+            // Dispose old track and update reference
+            val oldTrack = localVideoTrack
+            localVideoTrack = newTrack
+
+            // Emit new track to flow
+            sessionManagerScope.launch {
+                _localVideoTrackFlow.emit(localVideoTrack)
+            }
+
+            // Dispose old track after delay to ensure encoder has generated new SPS/PPS
+            // Qualcomm encoders (Snapdragon 8 Gen 2/3) need longer delay due to low-latency optimization
+            val encoderDelay = getEncoderReadyDelay()
+            logBuffer("Encoder ready delay: ${encoderDelay}ms (Qualcomm fast encoder: ${isQualcommFastEncoder()})")
+
+            mHandler?.postDelayed({
+                try {
+                    oldTrack.dispose()
+                    logBuffer("Encoder reset: old track disposed")
+                } catch (e: Exception) {
+                    Log.w(TAG_BUFFER, "Old track disposal warning: ${e.message}")
+                }
+
+                // RESUME frame delivery AFTER encoder is ready with new SPS/PPS
+                (screenCapturer as? ResizableScreenCapturer)?.resumeFrameDelivery()
+
+                // Force frame delivery
+                surfaceTextureHelper?.forceFrame()
+                logBuffer("Encoder reset complete, frame forced")
+            }, encoderDelay)
+
+        } catch (e: Exception) {
+            Log.e(TAG_BUFFER, "Encoder reconfiguration failed: ${e.message}")
+            // Fallback: resume frames and force frame
+            (screenCapturer as? ResizableScreenCapturer)?.resumeFrameDelivery()
+            surfaceTextureHelper?.forceFrame()
+        }
+    }
+
+    /**
+     * Schedule encoder reconfiguration with callback cancellation.
+     * Ensures only the latest rotation triggers reconfiguration.
+     *
+     * Since frames are paused, we can use a short delay (just enough for
+     * adaptOutputFormat to propagate). The encoder reset will resume frames.
+     */
+    private fun scheduleEncoderReconfiguration() {
+        // Cancel any pending reconfiguration
+        encoderReconfigRunnable?.let { mHandler?.removeCallbacks(it) }
+
+        encoderReconfigRunnable = Runnable {
+            if (isCaptureRunning && isIceConnected) {
+                forceEncoderReconfiguration()
+            } else {
+                // If not connected, just resume frames (no encoder to reconfigure)
+                (screenCapturer as? ResizableScreenCapturer)?.resumeFrameDelivery()
+                logBuffer("Encoder reconfig skipped (not connected), frames resumed")
+            }
+        }
+
+        // Short delay since frames are paused - just need adaptOutputFormat to propagate
+        val delay = 50L
+
+        logBuffer("Scheduling encoder reconfig in ${delay}ms (${streamWidth}x${streamHeight})")
+        mHandler?.postDelayed(encoderReconfigRunnable!!, delay)
+    }
+
+    private fun rotationToString(rotation: Int): String {
+        return when (rotation) {
+            Surface.ROTATION_0 -> "PORTRAIT (0°)"
+            Surface.ROTATION_90 -> "LANDSCAPE (90°)"
+            Surface.ROTATION_180 -> "PORTRAIT_INVERTED (180°)"
+            Surface.ROTATION_270 -> "LANDSCAPE_INVERTED (270°)"
+            else -> "UNKNOWN ($rotation)"
+        }
+    }
+
+    /**
+     * Cancel any pending rotation timeout.
+     */
+    private fun cancelRotationTimeout() {
+        rotationTimeoutRunnable?.let { mHandler?.removeCallbacks(it) }
+        rotationTimeoutRunnable = null
+    }
+
+    /**
+     * Schedule a timeout to apply pending rotation if DisplayListener doesn't confirm in time.
+     */
+    private fun scheduleRotationTimeout() {
+        cancelRotationTimeout()
+
+        rotationTimeoutRunnable = Runnable {
+            if (pendingRotation != -1 && isCaptureRunning) {
+                handleRotationTimeout()
+            }
+        }
+        mHandler?.postDelayed(rotationTimeoutRunnable!!, SYSTEM_ROTATION_TIMEOUT_MS)
+    }
+
+    /**
+     * Handle timeout: Check if system rotation matches pending.
+     *
+     * Design principle: "Display is Truth"
+     * - The capture should always follow Display.rotation (actual screen content)
+     * - If sensor detected rotation but Display didn't change, the foreground app
+     *   doesn't support that orientation - we should NOT override it
+     * - Only apply rotation if system actually rotated (confirmed by Display.rotation)
+     */
+    private fun handleRotationTimeout() {
         sessionManagerScope.launch {
             captureMutex.withLock {
-                if (!isCaptureRunning) {
-                    logBuffer("Cannot update resolution - capture not running")
-                    return@withLock
-                }
+                if (pendingRotation == -1 || !isCaptureRunning) return@withLock
 
-                val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-                windowManager.defaultDisplay.getRealMetrics(metrics)
-                streamWidth = metrics.widthPixels / 2
-                streamHeight = metrics.heightPixels / 2
+                // Verify current system rotation - this is the source of truth
+                val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
+                val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
+                val currentSystemRotation = display?.rotation ?: lastKnownRotation
 
-                logBuffer("Updating resolution to ${streamWidth}x${streamHeight}")
-
-                try {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                        // Android 14+: Only update VideoSource adapter, don't touch VirtualDisplay
-                        // The capture will continue at the original resolution, but output will be adapted
-                        logBuffer("Android 14+: Adapting output format only")
-                        videoSource.adaptOutputFormat(streamWidth, streamHeight, TARGET_FPS)
-                    } else {
-                        // Android 13 and below: Can safely change capture format
-                        logBuffer("Android 13-: Changing capture format")
-                        screenCapturer.changeCaptureFormat(streamWidth, streamHeight, TARGET_FPS)
+                when {
+                    currentSystemRotation == pendingRotation -> {
+                        // System rotated but DisplayListener missed it (rare edge case)
+                        logBuffer("Rotation timeout: Display confirms ${rotationToString(pendingRotation)}, applying")
+                        applyRotationLocked(pendingRotation)
                     }
-                    surfaceTextureHelper?.forceFrame()
-                } catch (e: Exception) {
-                    Log.e(TAG_BUFFER, "Error updating resolution: ${e.message}")
+                    else -> {
+                        // System didn't rotate = foreground app doesn't support this orientation
+                        // Cancel pending rotation and stay with current display orientation
+                        logBuffer("Rotation timeout: Display=${rotationToString(currentSystemRotation)} != Sensor=${rotationToString(pendingRotation)}. App doesn't support rotation, cancelling.")
+
+                        // Remember rejected sensor orientation to avoid repeated attempts
+                        val rejectedOrientation = pendingRotation
+                        pendingRotation = -1
+                        lastStableOrientation = rejectedOrientation  // Store rejected sensor orientation
+                        debounceStartTime = 0
+                        orientationStableSince = 0
+                    }
                 }
             }
+        }
+    }
+
+    /**
+     * Apply rotation change. Must be called within captureMutex.
+     * Resets pending state and updates capture dimensions.
+     *
+     * @param targetRotation The rotation to apply (Surface.ROTATION_*)
+     */
+    private fun applyRotationLocked(targetRotation: Int) {
+        // Reset pending state
+        pendingRotation = -1
+        lastStableOrientation = -1
+        debounceStartTime = 0
+
+        if (!isCaptureRunning) {
+            logBuffer("Cannot apply rotation - capture not running")
+            return
+        }
+
+        // Android 14+: Do NOT resize manually - onCapturedContentResize callback is the source of truth
+        // The callback will receive correct dimensions from the system and trigger resize with proper values
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            lastKnownRotation = targetRotation
+            logBuffer("Android 14+: Rotation tracked (resize delegated to system callback)")
+            return
+        }
+
+        // Calculate dimensions based on target rotation
+        val isLandscape = targetRotation == Surface.ROTATION_90 ||
+                          targetRotation == Surface.ROTATION_270
+
+        val newWidth = if (isLandscape) baseHeight else baseWidth
+        val newHeight = if (isLandscape) baseWidth else baseHeight
+
+        if (newWidth == streamWidth && newHeight == streamHeight) {
+            lastKnownRotation = targetRotation
+            return
+        }
+
+        lastKnownRotation = targetRotation
+        streamWidth = newWidth
+        streamHeight = newHeight
+
+        logBuffer("Rotation applied: ${streamWidth}x${streamHeight} (${rotationToString(targetRotation)})")
+
+        try {
+            // Android 13-: Reconfigure capture and encoder
+            // PAUSE frames to prevent SPS/PPS mismatch during transition
+            (screenCapturer as? ResizableScreenCapturer)?.pauseFrameDelivery()
+
+            screenCapturer.changeCaptureFormat(streamWidth, streamHeight, TARGET_FPS)
+            videoSource.adaptOutputFormat(streamWidth, streamHeight, TARGET_FPS)
+
+            // Schedule encoder reconfiguration (will resume frames when done)
+            if (isIceConnected) {
+                scheduleEncoderReconfiguration()
+            } else {
+                // Not connected - just resume frames
+                (screenCapturer as? ResizableScreenCapturer)?.resumeFrameDelivery()
+                surfaceTextureHelper?.forceFrame()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG_BUFFER, "Error applying rotation: ${e.message}")
+            (screenCapturer as? ResizableScreenCapturer)?.resumeFrameDelivery()
+            surfaceTextureHelper?.forceFrame()
         }
     }
 
@@ -602,6 +970,9 @@ class WebRTCScreenCaptureService : Service() {
         isIceConnected = false
         firstFrameSentAfterConnect = false
 
+        // Cancel any pending rotation timeout
+        cancelRotationTimeout()
+
         sessionManagerScope.launch {
             peerConnection?.connection?.close()
             peerConnection = null
@@ -612,6 +983,13 @@ class WebRTCScreenCaptureService : Service() {
             logConn("Connection closed, keeping capture running for reconnection (Android 14+)")
         } else {
             // Android 13-: Original behavior - stop capture completely
+            try {
+                val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
+                displayManager.unregisterDisplayListener(displayListener)
+            } catch (e: Exception) {
+                Log.e(TAG_BUFFER, "Failed to unregister DisplayListener: ${e.message}")
+            }
+
             try {
                 screenCapturer.stopCapture()
             } catch (e: Exception) {
@@ -641,10 +1019,24 @@ class WebRTCScreenCaptureService : Service() {
         val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         val mDisplay = windowManager.defaultDisplay
         mDisplay.getRealMetrics(metrics)
-        streamWidth = metrics.widthPixels / 2
-        streamHeight = metrics.heightPixels / 2
 
-        screenCapturer = ScreenCapturerAndroid(data, object : MediaProjection.Callback() {
+        // Capture base dimensions (portrait orientation: width < height)
+        // Use FULL dimensions to match onCapturedContentResize callback (Android 14+)
+        baseWidth = minOf(metrics.widthPixels, metrics.heightPixels)
+        baseHeight = maxOf(metrics.widthPixels, metrics.heightPixels)
+
+        // Set initial stream dimensions based on current rotation
+        lastKnownRotation = mDisplay.rotation
+        val isLandscape = lastKnownRotation == Surface.ROTATION_90 || lastKnownRotation == Surface.ROTATION_270
+        streamWidth = if (isLandscape) baseHeight else baseWidth
+        streamHeight = if (isLandscape) baseWidth else baseHeight
+
+        // Register display listener for system rotation events
+        val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
+        displayManager.registerDisplayListener(displayListener, mHandler)
+        logBuffer("DisplayListener registered")
+
+        val mediaProjectionCallback = object : MediaProjection.Callback() {
             override fun onStop() {
                 logBuffer("MediaProjection stopped")
                 isCaptureRunning = false
@@ -655,9 +1047,43 @@ class WebRTCScreenCaptureService : Service() {
                     logBuffer("Projection invalidated, will request re-authorization on next client connection")
                 }
             }
-        })
+        }
+
+        // Android 14+: Use ResizableScreenCapturer (supports VirtualDisplay.resize)
+        // Android 13-: Use standard ScreenCapturerAndroid
+        screenCapturer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val isQualcomm = isQualcommFastEncoder()
+            logBuffer("Creating ResizableScreenCapturer (Qualcomm: $isQualcomm)")
+            ResizableScreenCapturer(data!!, mediaProjectionCallback, isQualcomm)
+        } else {
+            logBuffer("Android 13-: Using ScreenCapturerAndroid")
+            ScreenCapturerAndroid(data!!, mediaProjectionCallback)
+        }
 
         videoSource = peerConnectionFactory.makeVideoSource(screenCapturer.isScreencast).apply {
+            // Android 14+: Set up resize listener to receive dimensions from system callback
+            // This ensures VideoSource uses correct dimensions from onCapturedContentResize
+            if (screenCapturer is ResizableScreenCapturer) {
+                val source = this
+                val resizableCapturer = screenCapturer as ResizableScreenCapturer
+                resizableCapturer.setResizeListener(object : ResizableScreenCapturer.ResizeListener {
+                    override fun onCaptureResized(width: Int, height: Int) {
+                        logBuffer("System callback resize: ${width}x${height}")
+
+                        // 1. PAUSE frames immediately to prevent SPS/PPS mismatch
+                        resizableCapturer.pauseFrameDelivery()
+
+                        streamWidth = width
+                        streamHeight = height
+
+                        // 2. Update VideoSource adapter
+                        source.adaptOutputFormat(width, height, TARGET_FPS)
+
+                        // 3. Schedule encoder reconfig (will resume frames when done)
+                        scheduleEncoderReconfiguration()
+                    }
+                })
+            }
             adaptOutputFormat(
                 streamWidth,
                 streamHeight,
@@ -694,6 +1120,14 @@ class WebRTCScreenCaptureService : Service() {
                         logConn("*** STREAMING - First frame sent to client ***")
                     }
 
+                    // Android 14+: VirtualDisplay captures correctly oriented content
+                    // No pixel rotation needed - buffer dimensions are fixed, letterboxing may occur
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        capturerObserver.onFrameCaptured(frame)
+                        return
+                    }
+
+                    // Android 13-: frames already come correctly sized via changeCaptureFormat()
                     capturerObserver.onFrameCaptured(frame)
                 }
             }

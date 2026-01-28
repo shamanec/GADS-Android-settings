@@ -252,6 +252,7 @@ class StreamPeerConnection(
       PeerConnection.IceConnectionState.CONNECTED -> statsJob = observeStats()
       else -> Unit
     }
+    newState?.let { onIceConnectionChange?.invoke(it) }
   }
 
   /**
