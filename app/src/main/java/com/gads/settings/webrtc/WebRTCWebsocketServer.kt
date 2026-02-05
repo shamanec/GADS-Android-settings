@@ -4,6 +4,7 @@ import android.util.Log
 import org.java_websocket.WebSocket
 import org.java_websocket.handshake.ClientHandshake
 import org.java_websocket.server.WebSocketServer
+import org.json.JSONObject
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 
@@ -32,6 +33,25 @@ class WebRTCWebsocketServer(port: Int, private val webRTCScreenCaptureService: W
 
     override fun onMessage(conn: WebSocket, message: String) {
         Log.d(TAG, "Received message - $message")
+
+        if (message.startsWith("{") && message.contains("\"turn\"")) {
+            try {
+                val json = JSONObject(message)
+                if (json.getString("type") == "turn") {
+                    val server = json.getString("server")
+                    val port = json.getInt("port")
+                    val username = json.getString("username")
+                    val password = json.getString("password")
+
+                    Log.d(TAG, "Message was TURN config, updating TURN servers")
+                    webRTCScreenCaptureService.updateTURNConfig(server, port, username, password)
+                    return
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to parse TURN config: ${e.message}")
+            }
+        }
+
         if (message.contains("offer")) {
             Log.d(TAG, "Message was WebRTC offer, handling offer")
             webRTCScreenCaptureService.setReceivedOffer(message)

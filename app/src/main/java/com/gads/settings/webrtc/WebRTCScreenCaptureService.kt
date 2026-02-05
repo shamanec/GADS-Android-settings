@@ -77,6 +77,9 @@ class WebRTCScreenCaptureService : Service() {
     private var peerConnectionFactory: StreamPeerConnectionFactory = StreamPeerConnectionFactory(this)
     private val sessionManagerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    // TURN server configuration (received via WebSocket before offer)
+    private var turnIceServers: List<PeerConnection.IceServer> = emptyList()
+
     // Screen and video
     private lateinit var screenCapturer: VideoCapturer
     private lateinit var videoSource: VideoSource
@@ -447,10 +450,28 @@ class WebRTCScreenCaptureService : Service() {
             peerConnection = null
 
             logConn("Creating PeerConnection...")
+
+            // Build RTCConfiguration with TURN servers if available
+            val iceServers = mutableListOf(
+                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
+            )
+            iceServers.addAll(turnIceServers)
+
+            val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
+                sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                enableCpuOveruseDetection = false
+                enableDscp = true
+                continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+                iceTransportsType = PeerConnection.IceTransportsType.ALL
+                iceCandidatePoolSize = 5
+            }
+
+            logConn("PeerConnection config: ${iceServers.size} ICE servers (STUN + ${turnIceServers.size} TURN)")
+
             // Create a StreamPeerConnection
             peerConnection = peerConnectionFactory.makePeerConnection(
                 coroutineScope = sessionManagerScope,
-                configuration = peerConnectionFactory.rtcConfig,
+                configuration = rtcConfig,
                 type = StreamPeerType.SUBSCRIBER,
                 mediaConstraints = mediaConstraints,
                 onIceCandidateRequest = { iceCandidate, _ ->
@@ -486,6 +507,29 @@ class WebRTCScreenCaptureService : Service() {
             sendAnswer()
         }
     }
+
+    /**
+     * Update TURN server configuration (must be called BEFORE offer is received)
+     * This stores TURN servers to be used when PeerConnection is created
+     */
+    fun updateTURNConfig(server: String, port: Int, username: String, password: String) {
+        Log.i(TAG_CONN, "Storing TURN config: $server:$port (will apply on next PeerConnection)")
+
+        val turnUri = "turn:$server:$port"
+        turnIceServers = listOf(
+            PeerConnection.IceServer.builder(turnUri)
+                .setUsername(username)
+                .setPassword(password)
+                .createIceServer()
+        )
+
+        Log.i(TAG_CONN, "TURN config stored successfully")
+    }
+
+    /**
+     * Check if TURN configuration has been set
+     */
+    fun hasTURNConfigured(): Boolean = turnIceServers.isNotEmpty()
 
     /**
      * Handle ICE candidate messages from the React UI client
@@ -539,99 +583,91 @@ class WebRTCScreenCaptureService : Service() {
     private suspend fun sendAnswer() {
         logConn("sendAnswer (buffer ready: $firstFrameCaptured)")
 
-        // Set the offer from the React UI client as remote description
-        val setRemoteResult = peerConnection?.setRemoteDescription(offer)
-
         if (!::localVideoTrack.isInitialized) {
             Log.e(TAG_CONN, "sendAnswer: localVideoTrack is not initialized!")
             return
         }
 
-        val mediaStreamLabels = listOf("ARDAMS")
-        // Add the video streaming track to the peer connection
-        // Or no video will be displayed in the React UI client
-        peerConnection?.connection?.addTrack(localVideoTrack, mediaStreamLabels)
+        peerConnection?.connection?.setRemoteDescription(object : org.webrtc.SdpObserver {
+            override fun onSetSuccess() {
+                val mediaStreamLabels = listOf("ARDAMS")
+                peerConnection?.connection?.addTrack(localVideoTrack, mediaStreamLabels)
 
-        // Update the transceivers direction because we only send video, we don't expect to receive
-        peerConnection?.connection?.transceivers?.forEach { transceiver ->
-            transceiver.setDirection(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY)
-            // Configure single stream with adaptive bitrate
-            val sender = transceiver.sender
-            val parameters = sender.parameters
-
-            // Get existing encoding or create new one
-            val encoding = if (parameters.encodings.isNotEmpty()) {
-                parameters.encodings[0]
-            } else {
-                // Create new encoding with default values
-                RtpParameters.Encoding(null, true, 1.0).also {
-                    parameters.encodings.add(it)
+                peerConnection?.connection?.transceivers?.forEach { transceiver ->
+                    transceiver.setDirection(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY)
+                    configureEncodingParameters(transceiver)
                 }
+
+                peerConnection?.connection?.createAnswer(object : org.webrtc.SdpObserver {
+                    override fun onCreateSuccess(answer: SessionDescription?) {
+                        peerConnection?.connection?.setLocalDescription(object : org.webrtc.SdpObserver {
+                            override fun onSetSuccess() {
+                                peerConnection?.connection?.setBitrate(1_000_000, 300_000, 5_000_000)
+                                updatePeerConnectionConstraints()
+
+                                val jsonAnswer = JSONObject().apply {
+                                    put("type", answer?.type?.canonicalForm())
+                                    put("sdp", answer?.description)
+                                }.toString()
+                                server.sendMessage(jsonAnswer)
+
+                                forceInitialFrame()
+                            }
+
+                            override fun onSetFailure(error: String?) {
+                                Log.e(TAG_CONN, "setLocalDescription failed: $error")
+                            }
+
+                            override fun onCreateSuccess(sdp: SessionDescription?) {}
+                            override fun onCreateFailure(error: String?) {}
+                        }, answer)
+                    }
+
+                    override fun onCreateFailure(error: String?) {
+                        Log.e(TAG_CONN, "createAnswer failed: $error")
+                    }
+
+                    override fun onSetSuccess() {}
+                    override fun onSetFailure(error: String?) {}
+                }, mediaConstraints)
             }
 
-            // Configure the encoding
-            encoding.apply {
-                // Bitrate settings
-                minBitrateBps = 1_000_000
-                maxBitrateBps = 5_000_000
-                maxFramerate = 30
-                // No resolution scaling for screen share
-                scaleResolutionDownBy = 1.0
-
-                // Ensure encoding is active
-                active = true
-
-                // Try to set scalability mode if supported
-                try {
-                    scalabilityMode = "L1T1"
-                } catch (e: Exception) {
-                    Log.w(TAG_CONN, "Scalability mode L1T1 not supported: ${e.message}")
-                }
+            override fun onSetFailure(error: String?) {
+                Log.e(TAG_CONN, "setRemoteDescription failed: $error")
             }
 
-            // Set degradation preference if supported
+            override fun onCreateSuccess(sdp: SessionDescription?) {}
+            override fun onCreateFailure(error: String?) {}
+        }, offer)
+    }
+
+    private fun configureEncodingParameters(transceiver: RtpTransceiver) {
+        val sender = transceiver.sender
+        val parameters = sender.parameters
+
+        val encoding = if (parameters.encodings.isNotEmpty()) {
+            parameters.encodings[0]
+        } else {
+            RtpParameters.Encoding(null, true, 1.0).also {
+                parameters.encodings.add(it)
+            }
+        }
+
+        encoding.apply {
+            minBitrateBps = 1_000_000
+            maxBitrateBps = 5_000_000
+            maxFramerate = 30
+            scaleResolutionDownBy = 1.0
+            active = true
+
             try {
-                // Maintain framerate at all costs for responsiveness
-                RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
+                scalabilityMode = "L1T1"
             } catch (e: Exception) {
-                Log.w(TAG_CONN, "Degradation preference not supported: ${e.message}")
+                Log.w(TAG_CONN, "Scalability mode L1T1 not supported: ${e.message}")
             }
-
-            // Apply the parameters
-            sender.parameters = parameters
         }
 
-        setRemoteResult?.onSuccess {
-            // Create an answer SessionDescription for the React UI client
-            val answer = peerConnection?.createAnswer()?.getOrThrow()
-
-            // Set the answer as a local description
-            val result = peerConnection?.setLocalDescription(answer!!)
-
-            peerConnection?.connection?.setBitrate(1_000_000, 300_000, 5_000_000)
-            updatePeerConnectionConstraints()
-
-            // If setting answer as local description was successful
-            result?.onSuccess {
-                val iceState = peerConnection?.connection?.iceConnectionState()
-                logConn("Answer ready, ICE state: $iceState")
-
-                // Build the answer json
-                val jsonAnswer = JSONObject().apply {
-                    put("type", answer?.type?.canonicalForm())
-                    put("sdp", answer?.description)
-                }.toString()
-                // Send the answer JSON over the websocket to the signalling server
-                server.sendMessage(jsonAnswer)
-
-                // Force initial frame to prevent black screen on connect
-                forceInitialFrame()
-            }?.onFailure {
-                Log.e(TAG_CONN, "Failed to set local description: ${it.message}")
-            }
-        }?.onFailure {
-            Log.e(TAG_CONN, "Failed to set remote description: ${it.message}")
-        }
+        sender.parameters = parameters
     }
 
     private fun forceInitialFrame() {
