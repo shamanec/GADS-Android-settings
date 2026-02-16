@@ -69,10 +69,22 @@ fun exec(
 data class TapRequest(val x: Float, val y: Float)
 
 @Serializable
+data class DoubleTapRequest(val x: Float, val y: Float)
+
+@Serializable
 data class TouchAndHoldRequest(val x: Float, val y: Float, val duration: Long)
 
 @Serializable
 data class SwipeRequest(val x1: Float, val y1: Float, val x2: Float, val y2: Float, val duration: Int = 300)
+
+@Serializable
+data class PinchRequest(
+    val centerX: Float,
+    val centerY: Float,
+    val scale: Float,
+    val duration: Int = 300,
+    val direction: String = "diagonal"
+)
 
 @Serializable
 data class StatusResponse(val status: String, val message: String? = null)
@@ -165,6 +177,23 @@ class RemoteControlServer(private val port: Int) {
                     }
                 }
 
+                post("/doubleTap") {
+                    try {
+                        val request = call.receive<DoubleTapRequest>()
+                        try {
+                            Log.d(logTag, "Attempting to perform double tap action at coordinates `${request.x}:${request.y}`")
+                            inputInjector.doubleTap(request.x, request.y)
+                            call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully performed double tap action"))
+                        } catch (e: Exception) {
+                            Log.e(logTag, "Internal error performing double tap action: ${e.message}")
+                            call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed performing double tap action - ${e.message}"))
+                        }
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Bad request performing double tap action: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid double tap request - ${e.message}"))
+                    }
+                }
+
                 post("/touchAndHold") {
                     try {
                         val request = call.receive<TouchAndHoldRequest>()
@@ -206,6 +235,24 @@ class RemoteControlServer(private val port: Int) {
                     } catch (e: Exception) {
                         Log.e(logTag, "Bad request performing swipe action: ${e.message}")
                         call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid swipe request - ${e.message}"))
+                    }
+                }
+
+                post("/pinch") {
+                    try {
+                        val request = call.receive<PinchRequest>()
+                        Log.d(logTag, "Performing pinch at (${request.centerX}, ${request.centerY}) scale=${request.scale}")
+
+                        try {
+                            inputInjector.pinch(request.centerX, request.centerY, request.scale, request.duration, request.direction)
+                            call.respond(HttpStatusCode.OK, StatusResponse("success", "Pinch executed successfully"))
+                        } catch (e: Exception) {
+                            Log.e(logTag, "Failed to execute pinch: ${e.message}")
+                            call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Pinch failed - ${e.message}"))
+                        }
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Invalid pinch request: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid request - ${e.message}"))
                     }
                 }
 
@@ -599,6 +646,40 @@ class InputInjector {
     }
 
     /**
+     * Inject double tap event at coordinates with Android framework-compliant timing
+     */
+    fun doubleTap(x: Float, y: Float) {
+        // First tap
+        val time1 = SystemClock.uptimeMillis()
+        val down1 = MotionEvent.obtain(time1, time1, MotionEvent.ACTION_DOWN, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        val up1 = MotionEvent.obtain(time1, time1 + 10, MotionEvent.ACTION_UP, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        injectEvent(down1)
+        injectEvent(up1)
+        down1.recycle()
+        up1.recycle()
+
+        // Wait within the double tap window (40ms < 50ms < 300ms)
+        Thread.sleep(50)
+
+        // Second tap
+        val time2 = SystemClock.uptimeMillis()
+        val down2 = MotionEvent.obtain(time2, time2, MotionEvent.ACTION_DOWN, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        val up2 = MotionEvent.obtain(time2, time2 + 10, MotionEvent.ACTION_UP, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        injectEvent(down2)
+        injectEvent(up2)
+        down2.recycle()
+        up2.recycle()
+    }
+
+    /**
      * Inject touch&hold event at coordinates
      */
     fun touchAndHoldAsync(
@@ -684,6 +765,148 @@ class InputInjector {
         down.recycle()
         up.recycle()
     }
+
+    fun pinch(centerX: Float, centerY: Float, scale: Float, duration: Int, direction: String = "diagonal") {
+        val startTime = SystemClock.uptimeMillis()
+
+        val baseDistance = 200f
+        val startDistance = if (scale < 1.0f) baseDistance else baseDistance / scale
+        val endDistance = if (scale < 1.0f) baseDistance * scale else baseDistance
+
+        val pointerProp1 = MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = MotionEvent.TOOL_TYPE_FINGER
+        }
+        val pointerProp2 = MotionEvent.PointerProperties().apply {
+            id = 1
+            toolType = MotionEvent.TOOL_TYPE_FINGER
+        }
+        val props = arrayOf(pointerProp1, pointerProp2)
+
+        val (startX1, startY1, startX2, startY2) = when (direction) {
+            "horizontal" -> arrayOf(
+                centerX - startDistance, centerY,
+                centerX + startDistance, centerY
+            )
+            "vertical" -> arrayOf(
+                centerX, centerY - startDistance,
+                centerX, centerY + startDistance
+            )
+            else -> arrayOf(
+                centerX - startDistance, centerY - startDistance,
+                centerX + startDistance, centerY + startDistance
+            )
+        }
+
+        val startCoords1 = MotionEvent.PointerCoords().apply {
+            x = startX1
+            y = startY1
+            pressure = 1f
+            size = 1f
+        }
+        val startCoords2 = MotionEvent.PointerCoords().apply {
+            x = startX2
+            y = startY2
+            pressure = 1f
+            size = 1f
+        }
+
+        val down1 = MotionEvent.obtain(
+            startTime, startTime,
+            MotionEvent.ACTION_DOWN,
+            1, arrayOf(pointerProp1), arrayOf(startCoords1),
+            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+        )
+        injectEvent(down1)
+        down1.recycle()
+
+        val down2 = MotionEvent.obtain(
+            startTime, startTime,
+            MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2, props, arrayOf(startCoords1, startCoords2),
+            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+        )
+        injectEvent(down2)
+        down2.recycle()
+
+        val (endX1, endY1, endX2, endY2) = when (direction) {
+            "horizontal" -> arrayOf(
+                centerX - endDistance, centerY,
+                centerX + endDistance, centerY
+            )
+            "vertical" -> arrayOf(
+                centerX, centerY - endDistance,
+                centerX, centerY + endDistance
+            )
+            else -> arrayOf(
+                centerX - endDistance, centerY - endDistance,
+                centerX + endDistance, centerY + endDistance
+            )
+        }
+
+        val steps = maxOf(duration / 10, 20)
+
+        for (i in 1..steps) {
+            val eventTime = startTime + (i * duration / steps)
+            val progress = i.toFloat() / steps
+
+            val coords1 = MotionEvent.PointerCoords().apply {
+                x = startX1 + (endX1 - startX1) * progress
+                y = startY1 + (endY1 - startY1) * progress
+                pressure = 1f
+                size = 1f
+            }
+            val coords2 = MotionEvent.PointerCoords().apply {
+                x = startX2 + (endX2 - startX2) * progress
+                y = startY2 + (endY2 - startY2) * progress
+                pressure = 1f
+                size = 1f
+            }
+
+            val move = MotionEvent.obtain(
+                startTime, eventTime,
+                MotionEvent.ACTION_MOVE,
+                2, props, arrayOf(coords1, coords2),
+                0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+            )
+            injectEvent(move)
+            move.recycle()
+
+            Thread.sleep((duration / steps).toLong())
+        }
+
+        val endCoords1 = MotionEvent.PointerCoords().apply {
+            x = endX1
+            y = endY1
+            pressure = 1f
+            size = 1f
+        }
+        val endCoords2 = MotionEvent.PointerCoords().apply {
+            x = endX2
+            y = endY2
+            pressure = 1f
+            size = 1f
+        }
+
+        val endTime = startTime + duration
+        val up2 = MotionEvent.obtain(
+            startTime, endTime,
+            MotionEvent.ACTION_POINTER_UP or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2, props, arrayOf(endCoords1, endCoords2),
+            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+        )
+        injectEvent(up2)
+        up2.recycle()
+
+        val up1 = MotionEvent.obtain(
+            startTime, endTime,
+            MotionEvent.ACTION_UP,
+            1, arrayOf(pointerProp1), arrayOf(endCoords1),
+            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+        )
+        injectEvent(up1)
+        up1.recycle()
+    }
 }
 
 fun main(args: Array<String>) {
@@ -696,8 +919,10 @@ fun main(args: Array<String>) {
         Log.i(logTag, "Starting GADS remote control server on port `$port`...")
         Log.i(logTag, "Endpoints:")
         Log.i(logTag, "POST /tap ${jsonFormatter.encodeToString(TapRequest.serializer(), TapRequest(x = 100f, y = 200f))}")
+        Log.i(logTag, "POST /doubleTap ${jsonFormatter.encodeToString(DoubleTapRequest.serializer(), DoubleTapRequest(x = 100f, y = 200f))}")
         Log.i(logTag, "POST /swipe ${jsonFormatter.encodeToString(SwipeRequest.serializer(), SwipeRequest(x1 = 100f, y1 = 200f, x2 = 100f, y2 = 200f, duration = 1000))}")
         Log.i(logTag, "POST /touchAndHold ${jsonFormatter.encodeToString(TouchAndHoldRequest.serializer(), TouchAndHoldRequest(x = 100f, y = 200f, duration = 1000))}")
+        Log.i(logTag, "POST /pinch ${jsonFormatter.encodeToString(PinchRequest.serializer(), PinchRequest(centerX = 500f, centerY = 800f, scale = 2.0f, duration = 300, direction = "diagonal"))}")
         Log.i(logTag, "GET /screen-size")
         Log.i(logTag, "POST /clipboard")
         Log.i(logTag, "POST /home")
