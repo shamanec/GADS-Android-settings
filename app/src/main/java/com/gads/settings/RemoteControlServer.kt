@@ -69,6 +69,9 @@ fun exec(
 data class TapRequest(val x: Float, val y: Float)
 
 @Serializable
+data class DoubleTapRequest(val x: Float, val y: Float)
+
+@Serializable
 data class TouchAndHoldRequest(val x: Float, val y: Float, val duration: Long)
 
 @Serializable
@@ -171,6 +174,23 @@ class RemoteControlServer(private val port: Int) {
                     } catch (e: Exception) {
                         Log.e(logTag, "Bad request performing tap action: ${e.message}")
                         call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid tap request - ${e.message}"))
+                    }
+                }
+
+                post("/doubleTap") {
+                    try {
+                        val request = call.receive<DoubleTapRequest>()
+                        try {
+                            Log.d(logTag, "Attempting to perform double tap action at coordinates `${request.x}:${request.y}`")
+                            inputInjector.doubleTap(request.x, request.y)
+                            call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully performed double tap action"))
+                        } catch (e: Exception) {
+                            Log.e(logTag, "Internal error performing double tap action: ${e.message}")
+                            call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed performing double tap action - ${e.message}"))
+                        }
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Bad request performing double tap action: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid double tap request - ${e.message}"))
                     }
                 }
 
@@ -626,6 +646,40 @@ class InputInjector {
     }
 
     /**
+     * Inject double tap event at coordinates with Android framework-compliant timing
+     */
+    fun doubleTap(x: Float, y: Float) {
+        // First tap
+        val time1 = SystemClock.uptimeMillis()
+        val down1 = MotionEvent.obtain(time1, time1, MotionEvent.ACTION_DOWN, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        val up1 = MotionEvent.obtain(time1, time1 + 10, MotionEvent.ACTION_UP, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        injectEvent(down1)
+        injectEvent(up1)
+        down1.recycle()
+        up1.recycle()
+
+        // Wait within the double tap window (40ms < 50ms < 300ms)
+        Thread.sleep(50)
+
+        // Second tap
+        val time2 = SystemClock.uptimeMillis()
+        val down2 = MotionEvent.obtain(time2, time2, MotionEvent.ACTION_DOWN, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        val up2 = MotionEvent.obtain(time2, time2 + 10, MotionEvent.ACTION_UP, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        injectEvent(down2)
+        injectEvent(up2)
+        down2.recycle()
+        up2.recycle()
+    }
+
+    /**
      * Inject touch&hold event at coordinates
      */
     fun touchAndHoldAsync(
@@ -865,6 +919,7 @@ fun main(args: Array<String>) {
         Log.i(logTag, "Starting GADS remote control server on port `$port`...")
         Log.i(logTag, "Endpoints:")
         Log.i(logTag, "POST /tap ${jsonFormatter.encodeToString(TapRequest.serializer(), TapRequest(x = 100f, y = 200f))}")
+        Log.i(logTag, "POST /doubleTap ${jsonFormatter.encodeToString(DoubleTapRequest.serializer(), DoubleTapRequest(x = 100f, y = 200f))}")
         Log.i(logTag, "POST /swipe ${jsonFormatter.encodeToString(SwipeRequest.serializer(), SwipeRequest(x1 = 100f, y1 = 200f, x2 = 100f, y2 = 200f, duration = 1000))}")
         Log.i(logTag, "POST /touchAndHold ${jsonFormatter.encodeToString(TouchAndHoldRequest.serializer(), TouchAndHoldRequest(x = 100f, y = 200f, duration = 1000))}")
         Log.i(logTag, "POST /pinch ${jsonFormatter.encodeToString(PinchRequest.serializer(), PinchRequest(centerX = 500f, centerY = 800f, scale = 2.0f, duration = 300, direction = "diagonal"))}")
