@@ -19,6 +19,8 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 import androidx.core.util.Pair
+import com.gads.settings.audio.AudioCapturer
+import com.gads.settings.audio.AudioWebSocketSender
 import com.gads.settings.webrtc.peer.StreamPeerConnection
 import com.gads.settings.webrtc.peer.StreamPeerConnectionFactory
 import com.gads.settings.webrtc.peer.StreamPeerType
@@ -105,6 +107,10 @@ class WebRTCScreenCaptureService : Service() {
     // Android 14+: Flag to indicate projection was invalidated and needs re-authorization
     @Volatile
     private var projectionNeedsReauthorization = false
+
+    // Audio
+    private var audioCapturer: AudioCapturer? = null
+    private var audioWebSocketSender: AudioWebSocketSender? = null
 
     // FPS constant
     private val TARGET_FPS = 30
@@ -352,6 +358,16 @@ class WebRTCScreenCaptureService : Service() {
             }
         }
         orientationListener?.enable()
+
+        // Start audio capture and WebSocket sender for the lifetime of the service.
+        // The backend connects to port 1992 during device setup, so the server must be
+        // available regardless of whether a WebRTC session is active.
+        audioWebSocketSender = AudioWebSocketSender().also { it.start() }
+        audioCapturer = AudioCapturer().also { capturer ->
+            capturer.startCapture { pcmData, pts ->
+                audioWebSocketSender?.sendAudioFrame(pcmData, pts)
+            }
+        }
     }
 
     // The onStartCommand() method is called by the Android system when the service is started
@@ -404,6 +420,12 @@ class WebRTCScreenCaptureService : Service() {
 
         // Cancel any pending rotation timeout
         cancelRotationTimeout()
+
+        // Stop audio capture and WebSocket sender
+        audioCapturer?.stopCapture()
+        audioCapturer = null
+        audioWebSocketSender?.stop()
+        audioWebSocketSender = null
 
         // Cleanup capture when service is destroyed
         if (isCaptureRunning) {

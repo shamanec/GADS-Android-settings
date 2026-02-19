@@ -1,9 +1,11 @@
 package com.gads.settings.audio
 
+import android.Manifest
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
+import androidx.annotation.RequiresPermission
 
 /**
  * AudioCapturer captures PCM audio from the device microphone (external if connected via TRRS cable).
@@ -33,6 +35,7 @@ class AudioCapturer(
      * Start capturing audio and invoke callback for each frame
      * @param onAudioData Callback invoked with (pcmData: ByteArray, pts: Long) for each frame
      */
+    @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     fun startCapture(onAudioData: (ByteArray, Long) -> Unit) {
         if (isCapturing) {
             Log.w(TAG, "Audio capture already running")
@@ -58,9 +61,17 @@ class AudioCapturer(
                 audioFormat,
                 actualBufferSize
             )
+        } catch (e: SecurityException) {
+            Log.e(TAG, "AudioRecord DENIED: RECORD_AUDIO permission missing for this process - ${e.message}")
+            return
+        } catch (e: Exception) {
+            Log.e(TAG, "AudioRecord constructor threw ${e.javaClass.simpleName}: ${e.message}")
+            return
+        }
 
+        try {
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord failed to initialize")
+                Log.e(TAG, "AudioRecord state=${audioRecord?.state} (expected STATE_INITIALIZED=${AudioRecord.STATE_INITIALIZED}) - initialization failed without exception")
                 audioRecord?.release()
                 audioRecord = null
                 return

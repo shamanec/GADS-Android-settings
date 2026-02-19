@@ -120,7 +120,7 @@ class H264Server(
         try {
             websocketServer.isReuseAddr = true
             websocketServer.start()
-            Log.d(TAG, "WebSocket server started on port 1992")
+            Log.d(TAG, "Video WebSocket server started on port 1991")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start WebSocket server", e)
             throw e
