@@ -8,14 +8,14 @@ import android.util.Log
 import androidx.annotation.RequiresPermission
 
 /**
- * AudioCapturer captures PCM audio from the device microphone (external if connected via TRRS cable).
+ * AudioCapturer captures PCM audio from the device microphone.
  *
  * Specifications:
  * - Sample Rate: 48kHz (WebRTC standard)
  * - Channels: MONO
  * - Format: 16-bit PCM
  * - Buffer Size: 20ms frames (960 samples @ 48kHz = 1920 bytes)
- * - Audio Source: DEFAULT - Android automatically selects external mic if connected via TRRS adapter
+ * - Audio Source: DEFAULT
  */
 class AudioCapturer(
     private val sampleRate: Int = 48000,

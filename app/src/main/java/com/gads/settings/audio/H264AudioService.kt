@@ -5,23 +5,29 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.annotation.RequiresApi
 
 /**
  * Foreground service that runs AudioWebSocketSender + AudioCapturer within the
  * com.gads.settings app context, where RECORD_AUDIO permission is properly granted
  * and Android audio policy allows microphone access.
  *
- * This service is started by the GADS provider via:
+ * Started by the GADS provider via:
  *   adb shell am start-foreground-service -n com.gads.settings/.audio.H264AudioService
+ *       --es audio_input_type internal|microphone
  *
- * It replaces the previous approach of starting AudioRecord inside app_process (H264Server),
- * which fails because AudioFlinger rejects microphone access for shell uid processes.
+ * Audio input types:
+ * - "internal" (default): AudioPlaybackCapture — captures what the device is playing (Android 10+).
+ *   Waits for MediaProjection via MediaProjectionHolder (set when screen capture session starts).
+ * - "microphone": AudioRecord with DEFAULT source — captures via microphone.
  */
 class H264AudioService : Service() {
     private var audioWebSocketSender: AudioWebSocketSender? = null
     private var audioCapturer: AudioCapturer? = null
+    private var internalAudioCapturer: InternalAudioCapturer? = null
 
     companion object {
         private const val TAG = "H264AudioService"
@@ -34,19 +40,44 @@ class H264AudioService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
 
+        val audioInputType = intent?.getStringExtra("audio_input_type") ?: "internal"
         audioWebSocketSender = AudioWebSocketSender().also { it.start() }
+
+        if (audioInputType == "internal" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startInternalCapture()
+        } else {
+            startMicrophoneCapture()
+        }
+
+        Log.i(TAG, "H264 audio service started (input: $audioInputType, port 1992)")
+        return START_STICKY
+    }
+
+    private fun startMicrophoneCapture() {
         audioCapturer = AudioCapturer().also { capturer ->
             capturer.startCapture { pcmData, pts ->
                 audioWebSocketSender?.sendAudioFrame(pcmData, pts)
             }
         }
-        Log.i(TAG, "H264 audio service started (port 1992)")
-        return START_STICKY
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun startInternalCapture() {
+        MediaProjectionHolder.getOrListen { mp ->
+            internalAudioCapturer = InternalAudioCapturer(mp).also { capturer ->
+                capturer.startCapture { pcmData, pts ->
+                    audioWebSocketSender?.sendAudioFrame(pcmData, pts)
+                }
+            }
+            Log.i(TAG, "Internal audio capture started via MediaProjectionHolder")
+        }
     }
 
     override fun onDestroy() {
         audioCapturer?.stopCapture()
         audioCapturer = null
+        internalAudioCapturer?.stopCapture()
+        internalAudioCapturer = null
         audioWebSocketSender?.stop()
         audioWebSocketSender = null
         Log.i(TAG, "H264 audio service stopped")

@@ -19,8 +19,7 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Display
 import android.view.WindowManager
-import com.gads.settings.audio.AudioCapturer
-import com.gads.settings.audio.AudioWebSocketSender
+import com.gads.settings.audio.MediaProjectionHolder
 import com.gads.settings.server.H264Encoder
 import com.gads.settings.streaming.NotificationUtils.getNotification
 
@@ -61,10 +60,6 @@ class H264ScreenCaptureService: Service() {
     private var encoderHandler: Handler? = null
 
     var server: H264WebSocketServer? = null
-
-    // Audio capture members
-    private var audioCapturer: AudioCapturer? = null
-    private var audioSender: AudioWebSocketSender? = null
 
     val TAG: String = "GADS H264"
 
@@ -115,10 +110,6 @@ class H264ScreenCaptureService: Service() {
     fun setIFrameInterval(interval: Int) {
         this.iFrameInterval = interval
         Log.d(TAG, "I-frame interval set to: $iFrameInterval seconds")
-    }
-
-    fun getCachedConfigFrames(): Pair<ByteArray?, ByteArray?> {
-        return encoder?.getCachedConfigFrames() ?: Pair(null, null)
     }
 
     private fun isStartCommand(intent: Intent): Boolean {
@@ -253,46 +244,6 @@ class H264ScreenCaptureService: Service() {
         return Service.START_NOT_STICKY
     }
 
-    // Starts audio capture and WebSocket sender
-    private fun startAudioCapture() {
-        try {
-            Log.i(TAG, "Starting audio capture")
-
-            // Start audio WebSocket server
-            audioSender = AudioWebSocketSender(1992)
-            audioSender?.start()
-
-            // Start audio capturer
-            audioCapturer = AudioCapturer()
-            audioCapturer?.startCapture { pcmData, pts ->
-                // Send audio frame to provider via WebSocket
-                audioSender?.sendAudioFrame(pcmData, pts)
-            }
-
-            Log.i(TAG, "Audio capture started successfully")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start audio capture", e)
-            stopAudioCapture()
-        }
-    }
-
-    // Stops audio capture and releases resources
-    private fun stopAudioCapture() {
-        try {
-            Log.i(TAG, "Stopping audio capture")
-
-            audioCapturer?.stopCapture()
-            audioCapturer = null
-
-            audioSender?.stop()
-            audioSender = null
-
-            Log.i(TAG, "Audio capture stopped")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping audio capture", e)
-        }
-    }
-
     // Initializes MediaProjection for screen capture and starts the encoding pipeline.
     // This is called when the service receives a START command with MediaProjection permission.
     // Reference: https://developer.android.com/reference/android/media/projection/MediaProjection
@@ -306,27 +257,26 @@ class H264ScreenCaptureService: Service() {
                 // Register callback to handle when projection stops
                 mMediaProjection?.registerCallback(MediaProjectionStopCallback(), encoderHandler)
 
+                // Share MediaProjection with H264AudioService for internal audio capture
+                MediaProjectionHolder.set(mMediaProjection!!)
+
                 // Get the default display to capture
                 val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
                 mDisplay = windowManager.defaultDisplay
 
                 // Create virtual display and start encoding
                 createVirtualDisplay()
-
-                // Start audio capture and WebSocket sender
-                startAudioCapture()
             }
         }
     }
 
     // Stops the screen capture and releases all resources.
     private fun stopProjection() {
+        MediaProjectionHolder.clear()
         encoderHandler?.post {
             releaseEncoder()
             mMediaProjection?.stop()
         }
-        // Stop audio capture
-        stopAudioCapture()
     }
 
     // Restarts the encoder, typically called when orientation changes to adjust resolution.

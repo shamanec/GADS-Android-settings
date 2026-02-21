@@ -4,13 +4,16 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.projection.MediaProjection
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Surface
 import android.view.WindowManager
+import com.gads.settings.audio.AudioWebSocketSender
 import com.gads.settings.server.utils.EncoderConfig
 import com.gads.settings.server.wrappers.DisplayManagerWrapper
 
@@ -31,8 +34,6 @@ import com.gads.settings.server.wrappers.DisplayManagerWrapper
  */
 class H264Server(
     private val context: Context? = null,
-    private val useMediaProjection: Boolean = false,
-    private val mediaProjection: MediaProjection? = null,
     private val config: EncoderConfig = EncoderConfig()
 ) {
     private val TAG = "GADS H264 Server"
@@ -61,6 +62,12 @@ class H264Server(
     private var encoderThread: HandlerThread? = null
     private var encoderHandler: Handler? = null
 
+    // Internal audio capture (REMOTE_SUBMIX, shell privileges only)
+    private var audioRecord: AudioRecord? = null
+    private var audioWebSocketSender: AudioWebSocketSender? = null
+    @Volatile private var isAudioCapturing = false
+    private var audioThread: Thread? = null
+
     companion object {
         // Timing constants for encoder lifecycle management
         private const val ENCODER_RESTART_DELAY_MS = 500L // Delay to ensure MediaCodec resources are fully released
@@ -84,14 +91,16 @@ class H264Server(
                 val config = EncoderConfig.fromArgs(args)
                 Log.d(TAG, "Encoder config: $config")
 
-                val server = H264Server(
-                    context = null,
-                    useMediaProjection = false,
-                    mediaProjection = null,
-                    config = config
-                )
+                val audioInputType = args.find { it.startsWith("audio_input_type=") }?.substringAfter("=") ?: "microphone"
+                Log.d(TAG, "Audio input type: $audioInputType")
+
+                val server = H264Server(config = config)
 
                 server.start()
+
+                if (audioInputType == "internal") {
+                    server.startInternalAudioCapture()
+                }
 
                 // Keep main thread alive
                 Log.d(TAG, "Server started successfully. Press Ctrl+C to stop.")
@@ -161,7 +170,80 @@ class H264Server(
         encoderThread = null
         encoderHandler = null
 
+        // Stop internal audio capture if running
+        isAudioCapturing = false
+        audioThread?.join(1000)
+        audioThread = null
+        audioRecord?.stop()
+        audioRecord?.release()
+        audioRecord = null
+        audioWebSocketSender?.stop()
+        audioWebSocketSender = null
+
         Log.d(TAG, "H264Server stopped")
+    }
+
+    /**
+     * Capture internal device audio using AudioSource.REMOTE_SUBMIX.
+     * Requires shell privileges (app_process UID) — no additional permissions needed.
+     * Sends PCM frames via WebSocket on port 1992.
+     */
+    fun startInternalAudioCapture() {
+        val sampleRate = 48000
+        val bufferSize = sampleRate * 2 * 20 / 1000 // 20ms frames = 1920 bytes
+        val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val actualBufferSize = maxOf(bufferSize, minBufferSize)
+
+        // Test REMOTE_SUBMIX BEFORE claiming port 1992.
+        // If unavailable, H264AudioService (started by provider) will handle port 1992.
+        val record = try {
+            AudioRecord(
+                MediaRecorder.AudioSource.REMOTE_SUBMIX,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                actualBufferSize
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "REMOTE_SUBMIX not available on this device: ${e.message} — H264AudioService will handle audio")
+            return
+        }
+
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e(TAG, "REMOTE_SUBMIX not supported on this device — H264AudioService will handle audio")
+            record.release()
+            return
+        }
+
+        audioRecord = record
+
+        // REMOTE_SUBMIX works — claim port 1992 and start capture
+        audioWebSocketSender = AudioWebSocketSender(1992)
+        audioWebSocketSender?.start()
+
+        audioRecord?.startRecording()
+        isAudioCapturing = true
+
+        audioThread = Thread {
+            val buffer = ByteArray(bufferSize)
+            var frameCount = 0
+            Log.i(TAG, "Internal audio capture started (REMOTE_SUBMIX, port 1992)")
+            while (isAudioCapturing) {
+                val read = audioRecord?.read(buffer, 0, buffer.size) ?: -1
+                if (read > 0) {
+                    audioWebSocketSender?.sendAudioFrame(buffer.copyOf(read), System.nanoTime() / 1000)
+                    frameCount++
+                    if (frameCount % 100 == 0) Log.d(TAG, "Sent internal audio frame #$frameCount ($read bytes)")
+                } else if (read < 0) {
+                    Log.e(TAG, "AudioRecord read error: $read — stopping audio capture")
+                    break
+                }
+            }
+            Log.i(TAG, "Internal audio capture loop stopped ($frameCount frames)")
+        }.apply {
+            name = "InternalAudioThread"
+            start()
+        }
     }
 
     /**
@@ -194,13 +276,6 @@ class H264Server(
     fun setIFrameInterval(interval: Int) {
         this.iFrameInterval = interval
         Log.d(TAG, "I-frame interval set to: $iFrameInterval seconds")
-    }
-
-    /**
-     * Get cached SPS/PPS config frames.
-     */
-    fun getCachedConfigFrames(): Pair<ByteArray?, ByteArray?> {
-        return encoder?.getCachedConfigFrames() ?: Pair(null, null)
     }
 
     /**
@@ -253,7 +328,7 @@ class H264Server(
      */
     @SuppressLint("WrongConstant")
     private fun createVirtualDisplay() {
-        Log.d(TAG, "Creating VirtualDisplay (useMediaProjection=$useMediaProjection)...")
+        Log.d(TAG, "Creating VirtualDisplay...")
 
         // Get display metrics
         val metrics = getDisplayMetrics()
@@ -293,12 +368,7 @@ class H264Server(
                 throw RuntimeException("Failed to start encoder")
             }
 
-            // Create VirtualDisplay based on mode
-            if (useMediaProjection && mediaProjection != null) {
-                createVirtualDisplayWithMediaProjection(inputSurface)
-            } else {
-                createVirtualDisplayWithShellPrivileges(inputSurface)
-            }
+            createVirtualDisplayWithShellPrivileges(inputSurface)
 
             Log.d(TAG, "VirtualDisplay and encoder created successfully")
 
@@ -306,28 +376,6 @@ class H264Server(
             Log.e(TAG, "Error creating VirtualDisplay and encoder", e)
             throw e
         }
-    }
-
-    /**
-     * Create VirtualDisplay using MediaProjection (Activity mode).
-     */
-    private fun createVirtualDisplayWithMediaProjection(inputSurface: Surface) {
-        if (mediaProjection == null) {
-            throw IllegalStateException("MediaProjection is null but useMediaProjection=true")
-        }
-
-        mVirtualDisplay = mediaProjection.createVirtualDisplay(
-            "GADSScreenCapture",
-            mWidth,
-            mHeight,
-            mDensity,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
-            inputSurface,
-            null,
-            encoderHandler
-        )
-
-        Log.d(TAG, "VirtualDisplay created via MediaProjection")
     }
 
     // SurfaceControl display token (for fallback)

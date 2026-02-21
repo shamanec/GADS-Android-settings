@@ -126,10 +126,4 @@ class AudioWebSocketSender(private val port: Int = 1992) {
         }
     }
 
-    /**
-     * Check if a client is currently connected
-     */
-    fun isClientConnected(): Boolean {
-        return audioClient?.isOpen == true
-    }
 }

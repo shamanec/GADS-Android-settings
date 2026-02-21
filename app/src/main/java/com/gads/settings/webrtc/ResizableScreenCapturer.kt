@@ -11,6 +11,7 @@ import android.os.Build
 import android.util.Log
 import android.view.Display
 import android.view.Surface
+import com.gads.settings.audio.MediaProjectionHolder
 import org.webrtc.CapturerObserver
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.ThreadUtils
@@ -177,6 +178,7 @@ class ResizableScreenCapturer(
             Activity.RESULT_OK,
             mediaProjectionPermissionResultData
         )
+        MediaProjectionHolder.set(mediaProjection!!)
 
         // Register callback BEFORE createVirtualDisplay (required on Android 14+)
         mediaProjection?.registerCallback(resizeCallback, helper.handler)
@@ -383,6 +385,7 @@ class ResizableScreenCapturer(
             currentSurface = null
             mediaProjection?.stop()
             mediaProjection = null
+            MediaProjectionHolder.clear()
         }
         capturerObserver?.onCapturerStopped()
     }
