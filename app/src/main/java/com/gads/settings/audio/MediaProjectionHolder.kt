@@ -7,7 +7,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  * Singleton that holds the active MediaProjection instance and notifies listeners when it becomes available.
  *
  * ResizableScreenCapturer sets the projection when screen capture starts and clears it on stop.
- * H264AudioService registers a listener to start internal audio capture once the projection is ready.
+ * AudioService registers a listener to start internal audio capture once the projection is ready.
  */
 object MediaProjectionHolder {
     @Volatile private var mediaProjection: MediaProjection? = null

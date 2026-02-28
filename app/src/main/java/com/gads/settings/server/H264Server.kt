@@ -195,7 +195,7 @@ class H264Server(
         val actualBufferSize = maxOf(bufferSize, minBufferSize)
 
         // Test REMOTE_SUBMIX BEFORE claiming port 1992.
-        // If unavailable, H264AudioService (started by provider) will handle port 1992.
+        // If unavailable, AudioService (started by provider) will handle port 1992.
         val record = try {
             AudioRecord(
                 MediaRecorder.AudioSource.REMOTE_SUBMIX,
@@ -205,12 +205,12 @@ class H264Server(
                 actualBufferSize
             )
         } catch (e: Exception) {
-            Log.e(TAG, "REMOTE_SUBMIX not available on this device: ${e.message} — H264AudioService will handle audio")
+            Log.e(TAG, "REMOTE_SUBMIX not available on this device: ${e.message} — AudioService will handle audio")
             return
         }
 
         if (record.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "REMOTE_SUBMIX not supported on this device — H264AudioService will handle audio")
+            Log.e(TAG, "REMOTE_SUBMIX not supported on this device — AudioService will handle audio")
             record.release()
             return
         }

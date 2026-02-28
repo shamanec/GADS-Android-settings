@@ -10,14 +10,14 @@ import android.util.Log
  * Requests MediaProjection permission for internal audio capture (AudioPlaybackCapture).
  *
  * Shows the system screen recording dialog, obtains the MediaProjection token,
- * and stores it in MediaProjectionHolder. H264AudioService picks it up via getOrListen().
+ * and stores it in MediaProjectionHolder. AudioService picks it up via getOrListen().
  *
  * Triggered by the Go provider via:
- *   adb shell am start -n com.gads.settings/.audio.H264AudioProjectionActivity
+ *   adb shell am start -n com.gads.settings/.audio.AudioProjectionActivity
  */
-class H264AudioProjectionActivity : Activity() {
+class AudioProjectionActivity : Activity() {
     companion object {
-        private const val TAG = "H264AudioProjection"
+        private const val TAG = "AudioProjectionActivity"
         private const val REQUEST_CODE = 200
     }
 

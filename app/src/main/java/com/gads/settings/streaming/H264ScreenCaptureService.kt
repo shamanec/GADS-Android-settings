@@ -257,7 +257,7 @@ class H264ScreenCaptureService: Service() {
                 // Register callback to handle when projection stops
                 mMediaProjection?.registerCallback(MediaProjectionStopCallback(), encoderHandler)
 
-                // Share MediaProjection with H264AudioService for internal audio capture
+                // Share MediaProjection with AudioService for internal audio capture
                 MediaProjectionHolder.set(mMediaProjection!!)
 
                 // Get the default display to capture

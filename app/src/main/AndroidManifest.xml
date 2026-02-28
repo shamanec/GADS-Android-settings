@@ -96,13 +96,13 @@
         </service>
 
         <service
-            android:name=".audio.H264AudioService"
+            android:name=".audio.AudioService"
             android:foregroundServiceType="mediaProjection|microphone"
             android:exported="true">
         </service>
 
         <activity
-            android:name=".audio.H264AudioProjectionActivity"
+            android:name=".audio.AudioProjectionActivity"
             android:exported="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:excludeFromRecents="true">

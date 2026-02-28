@@ -16,7 +16,7 @@ import androidx.annotation.RequiresApi
  * and Android audio policy allows microphone access.
  *
  * Started by the GADS provider via:
- *   adb shell am start-foreground-service -n com.gads.settings/.audio.H264AudioService
+ *   adb shell am start-foreground-service -n com.gads.settings/.audio.AudioService
  *       --es audio_input_type internal|microphone
  *
  * Audio input types:
@@ -24,15 +24,15 @@ import androidx.annotation.RequiresApi
  *   Waits for MediaProjection via MediaProjectionHolder (set when screen capture session starts).
  * - "microphone": AudioRecord with DEFAULT source — captures via microphone.
  */
-class H264AudioService : Service() {
+class AudioService : Service() {
     private var audioWebSocketSender: AudioWebSocketSender? = null
     private var audioCapturer: AudioCapturer? = null
     private var internalAudioCapturer: InternalAudioCapturer? = null
 
     companion object {
-        private const val TAG = "H264AudioService"
+        private const val TAG = "AudioService"
         private const val NOTIFICATION_ID = 2001
-        private const val CHANNEL_ID = "gads_h264_audio"
+        private const val CHANNEL_ID = "gads_audio"
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -49,7 +49,7 @@ class H264AudioService : Service() {
             startMicrophoneCapture()
         }
 
-        Log.i(TAG, "H264 audio service started (input: $audioInputType, port 1992)")
+        Log.i(TAG, "Audio service started (input: $audioInputType, port 1992)")
         return START_STICKY
     }
 
@@ -80,7 +80,7 @@ class H264AudioService : Service() {
         internalAudioCapturer = null
         audioWebSocketSender?.stop()
         audioWebSocketSender = null
-        Log.i(TAG, "H264 audio service stopped")
+        Log.i(TAG, "Audio service stopped")
         super.onDestroy()
     }
 
