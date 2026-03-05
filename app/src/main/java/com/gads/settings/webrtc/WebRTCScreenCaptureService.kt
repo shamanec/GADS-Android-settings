@@ -19,8 +19,8 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 import androidx.core.util.Pair
-import com.gads.settings.audio.AudioCapturer
-import com.gads.settings.audio.AudioWebSocketSender
+import com.gads.settings.audio.InternalAudioCapturer
+import com.gads.settings.audio.MediaProjectionHolder
 import com.gads.settings.webrtc.peer.StreamPeerConnection
 import com.gads.settings.webrtc.peer.StreamPeerConnectionFactory
 import com.gads.settings.webrtc.peer.StreamPeerType
@@ -34,6 +34,9 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import org.webrtc.AudioSource
+import org.webrtc.AudioTrack
+import org.webrtc.DataChannel
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.PeerConnection
@@ -48,6 +51,7 @@ import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoSource
 import org.webrtc.VideoFrame
 import org.webrtc.VideoTrack
+import java.nio.ByteBuffer
 import java.util.UUID
 
 class WebRTCScreenCaptureService : Service() {
@@ -108,9 +112,18 @@ class WebRTCScreenCaptureService : Service() {
     @Volatile
     private var projectionNeedsReauthorization = false
 
-    // Audio
-    private var audioCapturer: AudioCapturer? = null
-    private var audioWebSocketSender: AudioWebSocketSender? = null
+    // Audio configuration (set from intent extras in onStartCommand)
+    private var audioInputType: String = "microphone"
+    private var audioStreamEnabled: Boolean = false
+    private var audioInitialized: Boolean = false
+
+    // Microphone audio: WebRTC audio source and track (used when audioInputType == "microphone")
+    private var localAudioSource: AudioSource? = null
+    private var localAudioTrack: AudioTrack? = null
+
+    // Internal audio: data channel + capturer (used when audioInputType == "internal", API 29+)
+    private var audioDataChannel: DataChannel? = null
+    private var internalAudioCapturer: InternalAudioCapturer? = null
 
     // FPS constant
     private val TARGET_FPS = 30
@@ -191,14 +204,19 @@ class WebRTCScreenCaptureService : Service() {
     }
 
     companion object {
-        fun getStartIntent(context: Context?, resultCode: Int, data: Intent?): Intent {
-            val intent = Intent(
-                context,
-                WebRTCScreenCaptureService::class.java
-            )
+        fun getStartIntent(
+            context: Context?,
+            resultCode: Int,
+            data: Intent?,
+            audioInputType: String = "microphone",
+            audioStreamEnabled: Boolean = false
+        ): Intent {
+            val intent = Intent(context, WebRTCScreenCaptureService::class.java)
             intent.putExtra("ACTION", "START")
             intent.putExtra("RESULT_CODE", resultCode)
             intent.putExtra("DATA", data)
+            intent.putExtra("AUDIO_INPUT_TYPE", audioInputType)
+            intent.putExtra("AUDIO_STREAM_ENABLED", audioStreamEnabled)
             return intent
         }
 
@@ -359,15 +377,6 @@ class WebRTCScreenCaptureService : Service() {
         }
         orientationListener?.enable()
 
-        // Start audio capture and WebSocket sender for the lifetime of the service.
-        // The backend connects to port 1992 during device setup, so the server must be
-        // available regardless of whether a WebRTC session is active.
-        audioWebSocketSender = AudioWebSocketSender().also { it.start() }
-        audioCapturer = AudioCapturer().also { capturer ->
-            capturer.startCapture { pcmData, pts ->
-                audioWebSocketSender?.sendAudioFrame(pcmData, pts)
-            }
-        }
     }
 
     // The onStartCommand() method is called by the Android system when the service is started
@@ -385,12 +394,28 @@ class WebRTCScreenCaptureService : Service() {
 
         // Start the foreground service
         if (isStartCommand(intent)) {
+            audioInputType = intent.getStringExtra("AUDIO_INPUT_TYPE") ?: "microphone"
+            audioStreamEnabled = intent.getBooleanExtra("AUDIO_STREAM_ENABLED", false)
+
             // Create notification
             val notification: Pair<Int, Notification> = WebRTCNotificationUtils.getNotification(
                 this
             )
             startForeground(notification.first, notification.second)
             logBuffer("Foreground service started")
+
+            // Setup microphone audio track; internal audio uses a DataChannel set up in sendAnswer()
+            if (audioStreamEnabled && audioInputType == "microphone" && !audioInitialized) {
+                val audioConstraints = MediaConstraints().apply {
+                    mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "false"))
+                    mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "false"))
+                    mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "false"))
+                }
+                localAudioSource = peerConnectionFactory.makeAudioSource(audioConstraints)
+                localAudioTrack = peerConnectionFactory.makeAudioTrack(localAudioSource!!, "audio0")
+                localAudioTrack?.setEnabled(true)
+                audioInitialized = true
+            }
 
             // Android 14+: Start capture immediately (Intent is one-time-use)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -421,11 +446,18 @@ class WebRTCScreenCaptureService : Service() {
         // Cancel any pending rotation timeout
         cancelRotationTimeout()
 
-        // Stop audio capture and WebSocket sender
-        audioCapturer?.stopCapture()
-        audioCapturer = null
-        audioWebSocketSender?.stop()
-        audioWebSocketSender = null
+        // Release WebRTC audio resources
+        localAudioTrack?.dispose()
+        localAudioTrack = null
+        localAudioSource?.dispose()
+        localAudioSource = null
+
+        // Release internal audio resources
+        internalAudioCapturer?.stopCapture()
+        internalAudioCapturer = null
+        audioDataChannel?.close()
+        audioDataChannel?.dispose()
+        audioDataChannel = null
 
         // Cleanup capture when service is destroyed
         if (isCaptureRunning) {
@@ -614,10 +646,34 @@ class WebRTCScreenCaptureService : Service() {
             override fun onSetSuccess() {
                 val mediaStreamLabels = listOf("ARDAMS")
                 peerConnection?.connection?.addTrack(localVideoTrack, mediaStreamLabels)
+                localAudioTrack?.let { peerConnection?.connection?.addTrack(it, mediaStreamLabels) }
+
+                // For internal audio: create a negotiated data channel to send raw PCM to the browser.
+                // Browser creates the same channel (id=42, negotiated) and plays via AudioContext.
+                if (audioStreamEnabled && audioInputType == "internal" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val init = DataChannel.Init().apply {
+                        negotiated = true
+                        id = 42
+                        ordered = true
+                    }
+                    audioDataChannel = peerConnection?.connection?.createDataChannel("audio", init)
+                    MediaProjectionHolder.getOrListen { mp ->
+                        val capturer = InternalAudioCapturer(mp)
+                        internalAudioCapturer = capturer
+                        capturer.startCapture { pcmData, _ ->
+                            val channel = audioDataChannel ?: return@startCapture
+                            if (channel.state() == DataChannel.State.OPEN) {
+                                channel.send(DataChannel.Buffer(ByteBuffer.wrap(pcmData), true))
+                            }
+                        }
+                    }
+                }
 
                 peerConnection?.connection?.transceivers?.forEach { transceiver ->
                     transceiver.setDirection(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY)
-                    configureEncodingParameters(transceiver)
+                    if (transceiver.sender.track()?.kind() == MediaStreamTrack.VIDEO_TRACK_KIND) {
+                        configureEncodingParameters(transceiver)
+                    }
                 }
 
                 peerConnection?.connection?.createAnswer(object : org.webrtc.SdpObserver {

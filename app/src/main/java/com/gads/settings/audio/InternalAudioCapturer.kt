@@ -87,8 +87,10 @@ class InternalAudioCapturer(
                     onAudioData(buffer.copyOf(read), System.nanoTime() / 1000)
                     frameCount++
                     if (frameCount % 100 == 0) Log.d(TAG, "Captured internal audio frame #$frameCount ($read bytes)")
-                } else if (read == AudioRecord.ERROR_INVALID_OPERATION || read == AudioRecord.ERROR_BAD_VALUE) {
-                    Log.e(TAG, "AudioRecord read error: $read")
+                } else if (read == AudioRecord.ERROR_INVALID_OPERATION ||
+                           read == AudioRecord.ERROR_BAD_VALUE ||
+                           read == AudioRecord.ERROR_DEAD_OBJECT) {
+                    Log.e(TAG, "AudioRecord read error: $read - stopping capture")
                     break
                 }
             }

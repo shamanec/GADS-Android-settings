@@ -5,10 +5,13 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.annotation.RequiresApi
+import androidx.core.app.ServiceCompat
 
 /**
  * Foreground service that runs AudioWebSocketSender + AudioCapturer within the
@@ -38,9 +41,21 @@ class AudioService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification())
-
         val audioInputType = intent?.getStringExtra("audio_input_type") ?: "internal"
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION requires android:project_media appops to be granted.
+            // Only request it for internal audio (AudioPlaybackCapture uses MediaProjection).
+            // For microphone audio, FOREGROUND_SERVICE_TYPE_MICROPHONE is sufficient.
+            val fgsType = if (audioInputType == "internal") {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), fgsType)
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
         audioWebSocketSender = AudioWebSocketSender().also { it.start() }
 
         if (audioInputType == "internal" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -64,6 +79,16 @@ class AudioService : Service() {
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun startInternalCapture() {
         MediaProjectionHolder.getOrListen { mp ->
+            // Register callback to recover if Android 15 stops the projection (e.g. lock screen)
+            mp.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Log.i(TAG, "MediaProjection stopped - stopping internal audio capture, awaiting new token")
+                    internalAudioCapturer?.stopCapture()
+                    internalAudioCapturer = null
+                    startInternalCapture()
+                }
+            }, null)
+
             internalAudioCapturer = InternalAudioCapturer(mp).also { capturer ->
                 capturer.startCapture { pcmData, pts ->
                     audioWebSocketSender?.sendAudioFrame(pcmData, pts)

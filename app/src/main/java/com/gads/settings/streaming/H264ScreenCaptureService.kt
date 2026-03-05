@@ -131,6 +131,16 @@ class H264ScreenCaptureService: Service() {
             encoderHandler?.post {
                 releaseEncoder()
                 mMediaProjection?.unregisterCallback(this@MediaProjectionStopCallback)
+                mMediaProjection = null
+
+                // Android 14+: MediaProjection token is single-use. Re-launch the capture activity
+                // to obtain a new token when the projection is stopped (e.g. lock screen on Android 15).
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    val reAuthIntent = Intent(this@H264ScreenCaptureService, H264ScreenCaptureActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    startActivity(reAuthIntent)
+                }
             }
         }
     }
@@ -256,9 +266,6 @@ class H264ScreenCaptureService: Service() {
             if (mMediaProjection != null) {
                 // Register callback to handle when projection stops
                 mMediaProjection?.registerCallback(MediaProjectionStopCallback(), encoderHandler)
-
-                // Share MediaProjection with AudioService for internal audio capture
-                MediaProjectionHolder.set(mMediaProjection!!)
 
                 // Get the default display to capture
                 val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager

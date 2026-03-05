@@ -21,16 +21,15 @@ class WebRTCScreenCaptureActivity : Activity() {
         // And start the ScreenCaptureService
         if (requestCode == REQUEST_CODE) {
             if (resultCode == RESULT_OK) {
+                val audioInputType = intent.getStringExtra("audio_input_type") ?: "microphone"
+                val audioStreamEnabled = intent.getBooleanExtra("audio_stream_enabled", false)
+                val serviceIntent = WebRTCScreenCaptureService.getStartIntent(
+                    this, resultCode, data, audioInputType, audioStreamEnabled
+                )
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(
-                        WebRTCScreenCaptureService.getStartIntent(
-                            this,
-                            resultCode,
-                            data
-                        )
-                    )
+                    startForegroundService(serviceIntent)
                 } else {
-                    startService(WebRTCScreenCaptureService.getStartIntent(this, resultCode, data))
+                    startService(serviceIntent)
                 }
             }
         }
