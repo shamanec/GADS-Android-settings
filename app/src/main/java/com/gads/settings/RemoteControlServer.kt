@@ -96,6 +96,12 @@ data class ScreenSizeResponse(val x: Int, val y: Int)
 data class ClipboardResponse(val value: String)
 
 @Serializable
+data class RunningApp(
+    @kotlinx.serialization.SerialName("bundle_identifier") val packageName: String,
+    @kotlinx.serialization.SerialName("app_name") val appName: String
+)
+
+@Serializable
 data class AndroidFileNode(
     val name: String,
     val isFile: Boolean = false,
@@ -118,6 +124,51 @@ class RemoteControlServer(private val port: Int) {
     
     // Cached reflection objects for SurfaceControl screenshot
     private val screenshotMethod: Method?
+
+    // PackageManager resolved via reflection — tries multiple approaches since we run as app_process
+    private val packageManager: android.content.pm.PackageManager? by lazy {
+        // Try 1: AppGlobals.getInitialApplication()
+        try {
+            val app = Class.forName("android.app.AppGlobals")
+                .getDeclaredMethod("getInitialApplication")
+                .invoke(null) as? android.app.Application
+            if (app != null) {
+                Log.d(logTag, "Got PackageManager via AppGlobals")
+                return@lazy app.packageManager
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "AppGlobals approach failed: ${e.message}")
+        }
+
+        // Try 2: ActivityThread.currentApplication()
+        try {
+            val app = Class.forName("android.app.ActivityThread")
+                .getDeclaredMethod("currentApplication")
+                .invoke(null) as? android.app.Application
+            if (app != null) {
+                Log.d(logTag, "Got PackageManager via ActivityThread.currentApplication()")
+                return@lazy app.packageManager
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "ActivityThread.currentApplication() approach failed: ${e.message}")
+        }
+
+        // Try 3: ActivityThread.systemMain().getSystemContext()
+        try {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val thread = atClass.getDeclaredMethod("systemMain").invoke(null)
+            val ctx = atClass.getDeclaredMethod("getSystemContext").invoke(thread) as? android.content.Context
+            if (ctx != null) {
+                Log.d(logTag, "Got PackageManager via ActivityThread.systemMain()")
+                return@lazy ctx.packageManager
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "ActivityThread.systemMain() approach failed: ${e.message}")
+        }
+
+        Log.e(logTag, "All PackageManager resolution approaches failed")
+        null
+    }
 
     init {
         // Initialize SurfaceControl reflection
@@ -395,6 +446,15 @@ class RemoteControlServer(private val port: Int) {
                 get("/ping") {
                     call.respond(HttpStatusCode.OK)
                 }
+
+                get("/running-apps") {
+                    try {
+                        call.respond(HttpStatusCode.OK, getRecentApps())
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Internal error getting running apps: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed getting running apps - ${e.message}"))
+                    }
+                }
             }
         }.start(wait = true)
     }
@@ -464,6 +524,35 @@ class RemoteControlServer(private val port: Int) {
         val newWidth = bitmap.width / scaleFactor
         val newHeight = bitmap.height / scaleFactor
         return Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun getRecentApps(): List<RunningApp> {
+        val output = exec("dumpsys activity recents")
+        val packageNames = mutableListOf<String>()
+        val recentLineRegex = Regex("""\* Recent #\d+:.*\bA=(?:\d+:)?([a-zA-Z][a-zA-Z0-9._]+)""")
+
+        // Split into per-task blocks so we can inspect each task's activityType
+        val blocks = output.split(Regex("""(?=\* Recent #\d+:)"""))
+        for (block in blocks) {
+            // Skip home/launcher tasks (activityType=2)
+            if (block.contains("activityType=2")) continue
+
+            recentLineRegex.find(block)?.groupValues?.get(1)?.let { pkg ->
+                if (pkg !in packageNames) packageNames.add(pkg)
+            }
+        }
+
+        return packageNames.map { pkg ->
+            val appName = try {
+                val info = packageManager?.getApplicationInfo(pkg, 0)
+                if (info != null) packageManager!!.getApplicationLabel(info).toString() else pkg
+            } catch (e: Exception) {
+                Log.w(logTag, "Failed to get label for $pkg: ${e.message}")
+                pkg
+            }
+            RunningApp(packageName = pkg, appName = appName)
+        }
     }
 
     private fun getFiles(): AndroidFileNode {
