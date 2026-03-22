@@ -539,7 +539,7 @@ class RemoteControlServer(private val port: Int) {
             if (block.contains("activityType=2")) continue
 
             recentLineRegex.find(block)?.groupValues?.get(1)?.let { pkg ->
-                if (pkg !in packageNames) packageNames.add(pkg)
+                if (pkg !in packageNames && pkg != "com.gads.settings") packageNames.add(pkg)
             }
         }
 
