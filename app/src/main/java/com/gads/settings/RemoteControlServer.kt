@@ -125,16 +125,16 @@ class RemoteControlServer(private val port: Int) {
     // Cached reflection objects for SurfaceControl screenshot
     private val screenshotMethod: Method?
 
-    // PackageManager resolved via reflection — tries multiple approaches since we run as app_process
-    private val packageManager: android.content.pm.PackageManager? by lazy {
+    // Context resolved via reflection — tries multiple approaches since we run as app_process
+    private val appContext: android.content.Context? by lazy {
         // Try 1: AppGlobals.getInitialApplication()
         try {
             val app = Class.forName("android.app.AppGlobals")
                 .getDeclaredMethod("getInitialApplication")
                 .invoke(null) as? android.app.Application
             if (app != null) {
-                Log.d(logTag, "Got PackageManager via AppGlobals")
-                return@lazy app.packageManager
+                Log.d(logTag, "Got context via AppGlobals")
+                return@lazy app
             }
         } catch (e: Exception) {
             Log.w(logTag, "AppGlobals approach failed: ${e.message}")
@@ -146,8 +146,8 @@ class RemoteControlServer(private val port: Int) {
                 .getDeclaredMethod("currentApplication")
                 .invoke(null) as? android.app.Application
             if (app != null) {
-                Log.d(logTag, "Got PackageManager via ActivityThread.currentApplication()")
-                return@lazy app.packageManager
+                Log.d(logTag, "Got context via ActivityThread.currentApplication()")
+                return@lazy app
             }
         } catch (e: Exception) {
             Log.w(logTag, "ActivityThread.currentApplication() approach failed: ${e.message}")
@@ -159,15 +159,19 @@ class RemoteControlServer(private val port: Int) {
             val thread = atClass.getDeclaredMethod("systemMain").invoke(null)
             val ctx = atClass.getDeclaredMethod("getSystemContext").invoke(thread) as? android.content.Context
             if (ctx != null) {
-                Log.d(logTag, "Got PackageManager via ActivityThread.systemMain()")
-                return@lazy ctx.packageManager
+                Log.d(logTag, "Got context via ActivityThread.systemMain()")
+                return@lazy ctx
             }
         } catch (e: Exception) {
             Log.w(logTag, "ActivityThread.systemMain() approach failed: ${e.message}")
         }
 
-        Log.e(logTag, "All PackageManager resolution approaches failed")
+        Log.e(logTag, "All context resolution approaches failed")
         null
+    }
+
+    private val packageManager: android.content.pm.PackageManager? by lazy {
+        appContext?.packageManager
     }
 
     init {
@@ -455,6 +459,22 @@ class RemoteControlServer(private val port: Int) {
                         call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed getting running apps - ${e.message}"))
                     }
                 }
+
+                post("/kill-app/{bundleId}") {
+                    val bundleId = call.parameters["bundleId"]
+                    if (bundleId.isNullOrBlank()) {
+                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Missing bundleId path parameter"))
+                        return@post
+                    }
+                    try {
+                        Log.d(logTag, "Killing app and removing from recents: $bundleId")
+                        killApp(bundleId)
+                        call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully killed $bundleId"))
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Failed to kill app $bundleId: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed to kill app - ${e.message}"))
+                    }
+                }
             }
         }.start(wait = true)
     }
@@ -552,6 +572,35 @@ class RemoteControlServer(private val port: Int) {
                 pkg
             }
             RunningApp(packageName = pkg, appName = appName)
+        }
+    }
+
+    private fun killApp(packageName: String) {
+        exec("am force-stop $packageName")
+
+        // getRecentTasks() only returns the calling app's tasks since API 21, so parse task ID
+        // from dumpsys output instead, then remove via reflection.
+        // Format: "* Recent #N: TaskRecord{hex #1085 A=10062:com.android.chrome ...}"
+        val recentsOutput = exec("dumpsys activity recents")
+        val taskIdRegex = Regex("""\* Recent #\d+:\s*\S+\{[^}]*?#(\d+)[^}]*?\bA=(?:\d+:)?${Regex.escape(packageName)}\b""")
+        val taskId = taskIdRegex.find(recentsOutput)?.groupValues?.get(1)?.toIntOrNull()
+
+        if (taskId == null) {
+            Log.d(logTag, "No recent task found for $packageName")
+            return
+        }
+
+        try {
+            // ActivityManager.removeTask() was removed; call through IActivityManager binder instead
+            val iActivityManager = android.app.ActivityManager::class.java
+                .getDeclaredMethod("getService")
+                .invoke(null)
+            iActivityManager.javaClass
+                .getMethod("removeTask", Int::class.javaPrimitiveType)
+                .invoke(iActivityManager, taskId)
+            Log.d(logTag, "Removed task #$taskId for $packageName from recents")
+        } catch (e: Exception) {
+            Log.w(logTag, "removeTask failed for $packageName: ${e.message}")
         }
     }
 
