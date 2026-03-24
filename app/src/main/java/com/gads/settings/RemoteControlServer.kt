@@ -9,7 +9,6 @@ import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyEvent
 import android.view.MotionEvent
-import androidx.annotation.RequiresApi
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
@@ -37,29 +36,29 @@ import android.util.Base64
 /**
  * Function for executing shell commands on the device
  */
-@RequiresApi(Build.VERSION_CODES.O)
 fun exec(
     cmd: String,
     asRoot: Boolean = false,
     timeoutSec: Long = 10
 ): String {
-    // build the command line
     val args = if (asRoot) arrayOf("su", "-c", cmd)
     else arrayOf("sh", "-c", cmd)
 
     val proc = ProcessBuilder(*args)
-        .redirectErrorStream(true)   // merge stderr into stdout
+        .redirectErrorStream(true)
         .start()
 
-    // read output in one go
     val output = BufferedReader(InputStreamReader(proc.inputStream)).use {
         it.readText()
     }
 
-    // wait (with timeout) so we don’t leak processes
-    if (!proc.waitFor(timeoutSec, TimeUnit.SECONDS)) {
-        proc.destroyForcibly()
-        throw RuntimeException("Command timed out: $cmd")
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (!proc.waitFor(timeoutSec, TimeUnit.SECONDS)) {
+            proc.destroyForcibly()
+            throw RuntimeException("Command timed out: $cmd")
+        }
+    } else {
+        proc.waitFor()
     }
 
     return output
@@ -96,9 +95,10 @@ data class ScreenSizeResponse(val x: Int, val y: Int)
 data class ClipboardResponse(val value: String)
 
 @Serializable
-data class RunningApp(
+data class AppInfo(
     @kotlinx.serialization.SerialName("bundle_identifier") val packageName: String,
-    @kotlinx.serialization.SerialName("app_name") val appName: String
+    @kotlinx.serialization.SerialName("app_name") val appName: String,
+    @kotlinx.serialization.SerialName("can_uninstall") val canUninstall: Boolean
 )
 
 @Serializable
@@ -116,6 +116,7 @@ data class ScreenshotResponse(val screenshot: String)
 /**
  * The ktor server accepting the requests for the remote control and data acquisition
  */
+@SuppressLint("PrivateApi", "DiscouragedPrivateApi")
 class RemoteControlServer(private val port: Int) {
     private val inputInjector = InputInjector()
     private var screenWidth: Int = 0
@@ -153,7 +154,27 @@ class RemoteControlServer(private val port: Int) {
             Log.w(logTag, "ActivityThread.currentApplication() approach failed: ${e.message}")
         }
 
-        // Try 3: ActivityThread.systemMain().getSystemContext()
+        // Try 3: ActivityThread.currentActivityThread().getSystemContext()
+        try {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val thread = atClass.getDeclaredMethod("currentActivityThread").invoke(null)
+            if (thread != null) {
+                val ctx = atClass.getDeclaredMethod("getSystemContext").invoke(thread) as? android.content.Context
+                if (ctx != null) {
+                    Log.d(logTag, "Got context via ActivityThread.currentActivityThread().getSystemContext()")
+                    return@lazy ctx
+                }
+                val app = atClass.getDeclaredMethod("getApplication").invoke(thread) as? android.app.Application
+                if (app != null) {
+                    Log.d(logTag, "Got context via ActivityThread.currentActivityThread().getApplication()")
+                    return@lazy app
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "ActivityThread.currentActivityThread() approach failed: ${e.message}")
+        }
+
+        // Try 4: ActivityThread.systemMain().getSystemContext()
         try {
             val atClass = Class.forName("android.app.ActivityThread")
             val thread = atClass.getDeclaredMethod("systemMain").invoke(null)
@@ -451,28 +472,14 @@ class RemoteControlServer(private val port: Int) {
                     call.respond(HttpStatusCode.OK)
                 }
 
-                get("/running-apps") {
+                get("/installed-apps") {
                     try {
-                        call.respond(HttpStatusCode.OK, getRecentApps())
+                        val installedApps = getInstalledApps()
+                        val filtered = installedApps.filterNot { it.packageName.contains("com.gads") }.filterNot { it.packageName.contains("com.shamanec") }
+                        call.respond(HttpStatusCode.OK, filtered)
                     } catch (e: Exception) {
-                        Log.e(logTag, "Internal error getting running apps: ${e.message}")
-                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed getting running apps - ${e.message}"))
-                    }
-                }
-
-                post("/kill-app/{bundleId}") {
-                    val bundleId = call.parameters["bundleId"]
-                    if (bundleId.isNullOrBlank()) {
-                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Missing bundleId path parameter"))
-                        return@post
-                    }
-                    try {
-                        Log.d(logTag, "Killing app and removing from recents: $bundleId")
-                        killApp(bundleId)
-                        call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully killed $bundleId"))
-                    } catch (e: Exception) {
-                        Log.e(logTag, "Failed to kill app $bundleId: ${e.message}")
-                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed to kill app - ${e.message}"))
+                        Log.e(logTag, "Internal error getting installed apps: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed getting installed apps - ${e.message}"))
                     }
                 }
             }
@@ -540,67 +547,76 @@ class RemoteControlServer(private val port: Int) {
         return outputStream.toByteArray()
     }
 
-    private fun scaleDown(bitmap: Bitmap, scaleFactor: Int): Bitmap {
-        val newWidth = bitmap.width / scaleFactor
-        val newHeight = bitmap.height / scaleFactor
-        return Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
+    private fun getInstalledApps(): List<AppInfo> {
+        val pm = packageManager
+        if (pm != null) {
+            return pm.getInstalledApplications(android.content.pm.PackageManager.GET_META_DATA)
+                .filter { it.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM == 0 }
+                .map { AppInfo(packageName = it.packageName, appName = pm.getApplicationLabel(it).toString(), canUninstall = true) }
+                .sortedBy { it.appName }
+        }
+
+        // Fallback: use IPackageManager binder directly via ServiceManager
+        Log.w(logTag, "PackageManager unavailable, trying IPackageManager binder")
+        val ipm = getIPackageManager()
+        if (ipm != null) {
+            return exec("pm list packages -3")
+                .lines()
+                .mapNotNull { line ->
+                    val pkg = line.removePrefix("package:").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                    val appName = resolveAppLabel(ipm, pkg) ?: pkg
+                    AppInfo(packageName = pkg, appName = appName, canUninstall = true)
+                }
+                .sortedBy { it.appName }
+        }
+
+        // Last resort: package names only
+        Log.w(logTag, "IPackageManager unavailable, returning package names only")
+        return exec("pm list packages -3")
+            .lines()
+            .mapNotNull { line ->
+                val pkg = line.removePrefix("package:").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                AppInfo(packageName = pkg, appName = pkg, canUninstall = true)
+            }
+            .sortedBy { it.packageName }
     }
 
-    @RequiresApi(Build.VERSION_CODES.O)
-    private fun getRecentApps(): List<RunningApp> {
-        val output = exec("dumpsys activity recents")
-        val packageNames = mutableListOf<String>()
-        val recentLineRegex = Regex("""\* Recent #\d+:.*\bA=(?:\d+:)?([a-zA-Z][a-zA-Z0-9._]+)""")
-
-        // Split into per-task blocks so we can inspect each task's activityType
-        val blocks = output.split(Regex("""(?=\* Recent #\d+:)"""))
-        for (block in blocks) {
-            // Skip home/launcher tasks (activityType=2)
-            if (block.contains("activityType=2")) continue
-
-            recentLineRegex.find(block)?.groupValues?.get(1)?.let { pkg ->
-                if (pkg !in packageNames && pkg != "com.gads.settings") packageNames.add(pkg)
-            }
-        }
-
-        return packageNames.map { pkg ->
-            val appName = try {
-                val info = packageManager?.getApplicationInfo(pkg, 0)
-                if (info != null) packageManager!!.getApplicationLabel(info).toString() else pkg
-            } catch (e: Exception) {
-                Log.w(logTag, "Failed to get label for $pkg: ${e.message}")
-                pkg
-            }
-            RunningApp(packageName = pkg, appName = appName)
-        }
-    }
-
-    private fun killApp(packageName: String) {
-        exec("am force-stop $packageName")
-
-        // getRecentTasks() only returns the calling app's tasks since API 21, so parse task ID
-        // from dumpsys output instead, then remove via reflection.
-        // Format: "* Recent #N: TaskRecord{hex #1085 A=10062:com.android.chrome ...}"
-        val recentsOutput = exec("dumpsys activity recents")
-        val taskIdRegex = Regex("""\* Recent #\d+:\s*\S+\{[^}]*?#(\d+)[^}]*?\bA=(?:\d+:)?${Regex.escape(packageName)}\b""")
-        val taskId = taskIdRegex.find(recentsOutput)?.groupValues?.get(1)?.toIntOrNull()
-
-        if (taskId == null) {
-            Log.d(logTag, "No recent task found for $packageName")
-            return
-        }
-
-        try {
-            // ActivityManager.removeTask() was removed; call through IActivityManager binder instead
-            val iActivityManager = android.app.ActivityManager::class.java
-                .getDeclaredMethod("getService")
-                .invoke(null)
-            iActivityManager.javaClass
-                .getMethod("removeTask", Int::class.javaPrimitiveType)
-                .invoke(iActivityManager, taskId)
-            Log.d(logTag, "Removed task #$taskId for $packageName from recents")
+    @SuppressLint("DiscouragedPrivateApi", "PrivateApi")
+    private fun getIPackageManager(): Any? {
+        return try {
+            val binder = Class.forName("android.os.ServiceManager")
+                .getDeclaredMethod("getService", String::class.java)
+                .invoke(null, "package") as? android.os.IBinder ?: return null
+            Class.forName("android.content.pm.IPackageManager\$Stub")
+                .getDeclaredMethod("asInterface", android.os.IBinder::class.java)
+                .invoke(null, binder)
         } catch (e: Exception) {
-            Log.w(logTag, "removeTask failed for $packageName: ${e.message}")
+            Log.w(logTag, "IPackageManager binder unavailable: ${e.message}")
+            null
+        }
+    }
+
+    @SuppressLint("DiscouragedPrivateApi")
+    private fun resolveAppLabel(ipm: Any, packageName: String): String? {
+        return try {
+            val appInfo = ipm.javaClass
+                .getMethod("getApplicationInfo", String::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                .invoke(ipm, packageName, 0, 0) as? android.content.pm.ApplicationInfo
+                ?: return null
+            // nonLocalizedLabel is set when the manifest uses a hardcoded string (no resource needed)
+            appInfo.nonLocalizedLabel?.toString()
+                ?: run {
+                    // Load label from APK resources without a Context
+                    val am = android.content.res.AssetManager::class.java.newInstance()
+                    android.content.res.AssetManager::class.java
+                        .getDeclaredMethod("addAssetPath", String::class.java)
+                        .apply { isAccessible = true }
+                        .invoke(am, appInfo.publicSourceDir)
+                    @Suppress("DEPRECATION")
+                    android.content.res.Resources(am, null, null).getString(appInfo.labelRes)
+                }
+        } catch (e: Exception) {
+            null
         }
     }
 
