@@ -13,6 +13,7 @@ import android.view.Surface
 import android.view.WindowManager
 import com.gads.settings.server.utils.EncoderConfig
 import com.gads.settings.server.wrappers.DisplayManagerWrapper
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Scrcpy-style H.264 screen capture server that can run with or without MediaProjection.
@@ -143,7 +144,7 @@ class H264Server(
         stopOrientationMonitoring()
 
         // Cancel any pending restart operations and reset the flag
-        isRestarting = false
+        isRestarting.set(false)
         encoderHandler?.removeCallbacksAndMessages(null)
 
         encoderHandler?.post {
@@ -222,12 +223,11 @@ class H264Server(
      */
     fun restartEncoder() {
         // Prevent concurrent restarts (race condition during rapid orientation changes)
-        if (isRestarting) {
+        if (!isRestarting.compareAndSet(false, true)) {
             Log.d(TAG, "Restart already in progress, ignoring")
             return
         }
 
-        isRestarting = true
         Log.d(TAG, "Starting encoder restart")
 
         // Cancel any pending createVirtualDisplay tasks to prevent multiple instances
@@ -242,7 +242,7 @@ class H264Server(
             try {
                 createVirtualDisplay()
             } finally {
-                isRestarting = false
+                isRestarting.set(false)
                 Log.d(TAG, "Encoder restart complete")
             }
         }, ENCODER_RESTART_DELAY_MS)
@@ -339,8 +339,7 @@ class H264Server(
     private var monitoringOrientation = false
 
     // Restart guard to prevent race conditions
-    @Volatile
-    private var isRestarting = false
+    private var isRestarting = AtomicBoolean(false)
 
     /**
      * Create VirtualDisplay using hidden APIs (app_process mode).

@@ -18,6 +18,7 @@ import android.view.WindowManager
 import com.gads.settings.server.wrappers.DisplayManagerWrapper
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.LinkedBlockingDeque
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * MJPEG screen capture server that can run with or without MediaProjection.
@@ -77,8 +78,7 @@ class MjpegServer(
     private var monitoringOrientation = false
 
     // Restart guard
-    @Volatile
-    private var isRestarting = false
+    private var isRestarting = AtomicBoolean(false)
 
     companion object {
         private const val CAPTURE_RESTART_DELAY_MS = 500L
@@ -150,7 +150,7 @@ class MjpegServer(
 
         stopOrientationMonitoring()
 
-        isRestarting = false
+        isRestarting.set(false)
         captureHandler?.removeCallbacksAndMessages(null)
 
         // Stop consumer thread
@@ -207,12 +207,11 @@ class MjpegServer(
     }
 
     fun restartCapture() {
-        if (isRestarting) {
+        if (!isRestarting.compareAndSet(false, true)) {
             Log.d(TAG, "Restart already in progress, ignoring")
             return
         }
 
-        isRestarting = true
         Log.d(TAG, "Starting capture restart")
 
         captureHandler?.removeCallbacksAndMessages(null)
@@ -224,7 +223,7 @@ class MjpegServer(
             try {
                 createVirtualDisplay()
             } finally {
-                isRestarting = false
+                isRestarting.set(false)
                 Log.d(TAG, "Capture restart complete")
             }
         }, CAPTURE_RESTART_DELAY_MS)
