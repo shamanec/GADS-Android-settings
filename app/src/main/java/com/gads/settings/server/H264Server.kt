@@ -189,8 +189,12 @@ class H264Server(
     /**
      * Set scaling factor (takes effect on next encoder restart).
      */
-    fun setScalingFactor(scalingFactor: Int) {
-        this.scalingFactor = scalingFactor
+    fun setScalingFactor(percentage: Int) {
+        this.scalingFactor = when (percentage) {
+            25 -> 4
+            50 -> 2
+            else -> 2
+        }
         Log.d(TAG, "Scaling factor set to: $scalingFactor")
     }
 

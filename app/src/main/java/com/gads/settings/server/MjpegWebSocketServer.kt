@@ -71,13 +71,7 @@ class MjpegWebSocketServer(
                 msgPart.startsWith("scalingFactor=") -> {
                     try {
                         val scalingFactor = msgPart.split("=")[1].toInt()
-                        if (scalingFactor == 50) {
-                            server.setScalingFactor(2)
-                        } else if (scalingFactor == 25) {
-                            server.setScalingFactor(4)
-                        } else {
-                            server.setScalingFactor(2)
-                        }
+                        server.setScalingFactor(scalingFactor)
                         needsRestart = true
                         Log.d(TAG, "Set scaling factor to: $scalingFactor")
                     } catch (e: Exception) {

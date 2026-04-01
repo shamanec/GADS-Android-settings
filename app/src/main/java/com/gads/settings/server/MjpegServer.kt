@@ -180,8 +180,12 @@ class MjpegServer(
         Log.d(TAG, "JPEG quality set to: $jpegQuality")
     }
 
-    fun setScalingFactor(factor: Int) {
-        this.scalingFactor = factor
+    fun setScalingFactor(percentage: Int) {
+        this.scalingFactor = when (percentage) {
+            25 -> 4
+            50 -> 2
+            else -> 2
+        }
         Log.d(TAG, "Scaling factor set to: $scalingFactor")
     }
 
