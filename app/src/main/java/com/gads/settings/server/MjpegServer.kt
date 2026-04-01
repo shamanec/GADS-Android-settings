@@ -4,18 +4,12 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.os.Handler
 import android.os.HandlerThread
-import android.util.DisplayMetrics
 import android.util.Log
-import android.view.Surface
-import android.view.WindowManager
-import com.gads.settings.server.wrappers.DisplayManagerWrapper
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.atomic.AtomicBoolean
@@ -41,8 +35,17 @@ class MjpegServer(
     // WebSocket server for broadcasting frames
     private val websocketServer = MjpegWebSocketServer(1993, this)
 
-    // Virtual display and image capture
-    private var mVirtualDisplay: VirtualDisplay? = null
+    // Display manager for VirtualDisplay lifecycle
+    private val displayManager = VirtualDisplayManager(
+        context = context,
+        useMediaProjection = useMediaProjection,
+        mediaProjection = mediaProjection,
+        onOrientationChanged = { restartCapture() }
+    ).apply {
+        setClientCheck { websocketServer.hasClients() }
+    }
+
+    // Image capture
     private var mImageReader: ImageReader? = null
 
     // Display metrics
@@ -69,20 +72,11 @@ class MjpegServer(
     private var captureThread: HandlerThread? = null
     private var captureHandler: Handler? = null
 
-    // SurfaceControl display token (for fallback)
-    private var surfaceControlDisplay: android.os.IBinder? = null
-
-    // Orientation monitoring
-    private var orientationMonitorThread: Thread? = null
-    @Volatile
-    private var monitoringOrientation = false
-
     // Restart guard
     private var isRestarting = AtomicBoolean(false)
 
     companion object {
         private const val CAPTURE_RESTART_DELAY_MS = 500L
-        private const val ORIENTATION_POLL_INTERVAL_MS = 500L
 
         /**
          * Main entry point for app_process execution.
@@ -95,11 +89,7 @@ class MjpegServer(
             Log.d(TAG, "Starting MJPEG server via app_process")
 
             try {
-                val server = MjpegServer(
-                    context = null,
-                    useMediaProjection = false,
-                    mediaProjection = null
-                )
+                val server = MjpegServer()
 
                 server.start()
 
@@ -147,8 +137,6 @@ class MjpegServer(
 
     fun stop() {
         Log.d(TAG, "Stopping MjpegServer...")
-
-        stopOrientationMonitoring()
 
         isRestarting.set(false)
         captureHandler?.removeCallbacksAndMessages(null)
@@ -198,12 +186,7 @@ class MjpegServer(
     }
 
     fun triggerScreenRefresh() {
-        try {
-            Runtime.getRuntime().exec(arrayOf("input", "keyevent", "KEYCODE_VOLUME_DOWN"))
-            Log.d(TAG, "Triggered screen refresh via volume UI")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to trigger screen refresh: ${e.message}")
-        }
+        displayManager.triggerScreenRefresh()
     }
 
     fun restartCapture() {
@@ -238,7 +221,7 @@ class MjpegServer(
         mImageReader?.close()
         mImageReader = null
 
-        val metrics = getDisplayMetrics()
+        val metrics = displayManager.getDisplayMetrics()
         val metricsWidth = metrics.widthPixels
         val metricsHeight = metrics.heightPixels
 
@@ -257,126 +240,20 @@ class MjpegServer(
 
             val inputSurface = mImageReader!!.surface
 
-            // Create VirtualDisplay based on mode
-            if (useMediaProjection && mediaProjection != null) {
-                createVirtualDisplayWithMediaProjection(inputSurface)
-            } else {
-                createVirtualDisplayWithShellPrivileges(inputSurface)
-            }
+            displayManager.createVirtualDisplay(
+                name = "GADSMjpegCapture",
+                width = mWidth,
+                height = mHeight,
+                density = mDensity,
+                surface = inputSurface,
+                handler = captureHandler
+            )
 
             Log.d(TAG, "VirtualDisplay and ImageReader created successfully")
 
         } catch (e: Exception) {
             Log.e(TAG, "Error creating VirtualDisplay and ImageReader", e)
             throw e
-        }
-    }
-
-    private fun createVirtualDisplayWithMediaProjection(inputSurface: Surface) {
-        if (mediaProjection == null) {
-            throw IllegalStateException("MediaProjection is null but useMediaProjection=true")
-        }
-
-        mVirtualDisplay = mediaProjection.createVirtualDisplay(
-            "GADSMjpegCapture",
-            mWidth,
-            mHeight,
-            mDensity,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
-            inputSurface,
-            null,
-            captureHandler
-        )
-
-        Log.d(TAG, "VirtualDisplay created via MediaProjection")
-    }
-
-    private fun createVirtualDisplayWithShellPrivileges(inputSurface: Surface) {
-        Log.d(TAG, "Attempting DisplayManager.createVirtualDisplay()...")
-        mVirtualDisplay = DisplayManagerWrapper.createVirtualDisplay(
-            name = "GADSMjpegCapture",
-            width = mWidth,
-            height = mHeight,
-            displayIdToMirror = 0,
-            surface = inputSurface
-        )
-
-        if (mVirtualDisplay != null) {
-            Log.d(TAG, "VirtualDisplay created via DisplayManager")
-            startOrientationMonitoring()
-            return
-        }
-
-        // Fallback to SurfaceControl
-        Log.w(TAG, "DisplayManager failed, trying SurfaceControl...")
-        createVirtualDisplayWithSurfaceControl(inputSurface)
-    }
-
-    private fun createVirtualDisplayWithSurfaceControl(inputSurface: Surface) {
-        try {
-            val displayToken = com.gads.settings.server.wrappers.SurfaceControlWrapper.createDisplay(
-                "GADSMjpegCapture",
-                secure = false
-            )
-
-            if (displayToken == null) {
-                throw RuntimeException("SurfaceControl.createDisplay() returned null")
-            }
-
-            surfaceControlDisplay = displayToken
-
-            val metrics = getDisplayMetrics()
-            val layerStack = 0
-
-            com.gads.settings.server.wrappers.SurfaceControlWrapper.openTransaction()
-            try {
-                com.gads.settings.server.wrappers.SurfaceControlWrapper.setDisplaySurface(displayToken, inputSurface)
-
-                val sourceRect = android.graphics.Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
-                val displayRect = android.graphics.Rect(0, 0, mWidth, mHeight)
-                com.gads.settings.server.wrappers.SurfaceControlWrapper.setDisplayProjection(
-                    displayToken,
-                    orientation = 0,
-                    layerStackRect = sourceRect,
-                    displayRect = displayRect
-                )
-
-                com.gads.settings.server.wrappers.SurfaceControlWrapper.setDisplayLayerStack(displayToken, layerStack)
-
-                Log.d(TAG, "SurfaceControl display configured: ${mWidth}x${mHeight}")
-            } finally {
-                com.gads.settings.server.wrappers.SurfaceControlWrapper.closeTransaction()
-            }
-
-            Log.d(TAG, "VirtualDisplay created via SurfaceControl (fallback)")
-            startOrientationMonitoring()
-
-        } catch (e: Exception) {
-            Log.e(TAG, "SurfaceControl fallback also failed", e)
-            e.printStackTrace()
-            throw RuntimeException("Both DisplayManager and SurfaceControl approaches failed. Error: ${e.message}", e)
-        }
-    }
-
-    private fun getDisplayMetrics(): DisplayMetrics {
-        if (context != null) {
-            val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-            val display = windowManager.defaultDisplay
-            val metrics = DisplayMetrics()
-            display.getRealMetrics(metrics)
-            return metrics
-        }
-
-        val metrics = DisplayManagerWrapper.getDisplayInfo(displayId = 0)
-        if (metrics != null) {
-            return metrics
-        }
-
-        Log.w(TAG, "Could not get display metrics, using defaults")
-        return DisplayMetrics().apply {
-            widthPixels = 1280
-            heightPixels = 720
-            densityDpi = 240
         }
     }
 
@@ -482,72 +359,13 @@ class MjpegServer(
         }
     }
 
-    private fun startOrientationMonitoring() {
-        val initialMetrics = getDisplayMetrics()
-        var lastWidth = initialMetrics.widthPixels
-        var lastHeight = initialMetrics.heightPixels
-
-        monitoringOrientation = true
-        orientationMonitorThread = Thread {
-            Log.d(TAG, "Orientation monitoring started (polling every ${ORIENTATION_POLL_INTERVAL_MS}ms)")
-
-            while (monitoringOrientation) {
-                try {
-                    Thread.sleep(ORIENTATION_POLL_INTERVAL_MS)
-
-                    if (!websocketServer.hasClients()) continue
-
-                    val metrics = getDisplayMetrics()
-                    val currentWidth = metrics.widthPixels
-                    val currentHeight = metrics.heightPixels
-
-                    if (currentWidth != lastWidth || currentHeight != lastHeight) {
-                        Log.d(TAG, "Display size changed: ${lastWidth}x${lastHeight} -> ${currentWidth}x${currentHeight}")
-
-                        lastWidth = currentWidth
-                        lastHeight = currentHeight
-
-                        restartCapture()
-                    }
-                } catch (e: InterruptedException) {
-                    break
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error in orientation monitoring", e)
-                }
-            }
-
-            Log.d(TAG, "Orientation monitoring stopped")
-        }
-        orientationMonitorThread?.start()
-    }
-
-    private fun stopOrientationMonitoring() {
-        monitoringOrientation = false
-        orientationMonitorThread?.interrupt()
-        orientationMonitorThread = null
-        Log.d(TAG, "Orientation monitoring stopped")
-    }
-
     private fun releaseCapture() {
         try {
-            stopOrientationMonitoring()
-
             mImageReader?.setOnImageAvailableListener(null, null)
             mImageReader?.close()
             mImageReader = null
 
-            mVirtualDisplay?.release()
-            mVirtualDisplay = null
-
-            surfaceControlDisplay?.let {
-                try {
-                    com.gads.settings.server.wrappers.SurfaceControlWrapper.destroyDisplay(it)
-                    Log.d(TAG, "SurfaceControl display destroyed")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error destroying SurfaceControl display", e)
-                }
-            }
-            surfaceControlDisplay = null
+            displayManager.release()
 
             Log.d(TAG, "Capture released")
         } catch (e: Exception) {

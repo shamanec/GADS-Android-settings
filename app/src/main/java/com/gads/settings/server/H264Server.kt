@@ -1,18 +1,12 @@
 package com.gads.settings.server
 
-import android.annotation.SuppressLint
 import android.content.Context
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
 import android.media.projection.MediaProjection
 import android.os.Handler
 import android.os.HandlerThread
-import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Surface
-import android.view.WindowManager
 import com.gads.settings.server.utils.EncoderConfig
-import com.gads.settings.server.wrappers.DisplayManagerWrapper
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -41,11 +35,22 @@ class H264Server(
     // WebSocket server for broadcasting frames
     private val websocketServer = H264WebSocketServer(1991, this)
 
+    // Display manager for VirtualDisplay lifecycle
+    private val displayManager: VirtualDisplayManager = VirtualDisplayManager(
+        context = context,
+        useMediaProjection = useMediaProjection,
+        mediaProjection = mediaProjection,
+        onOrientationChanged = {
+            restartEncoder()
+            // Trigger screen refresh after encoder restart to get immediate frame
+            encoderHandler?.postDelayed({
+                triggerScreenRefresh()
+            }, TOTAL_RESTART_REFRESH_DELAY_MS)
+        }
+    )
+
     // H.264 encoder instance
     private var encoder: H264Encoder? = null
-
-    // Virtual display
-    private var mVirtualDisplay: VirtualDisplay? = null
 
     // Display metrics
     private var mWidth = 0
@@ -62,12 +67,14 @@ class H264Server(
     private var encoderThread: HandlerThread? = null
     private var encoderHandler: Handler? = null
 
+    // Restart guard to prevent race conditions
+    private var isRestarting = AtomicBoolean(false)
+
     companion object {
         // Timing constants for encoder lifecycle management
         private const val ENCODER_RESTART_DELAY_MS = 500L // Delay to ensure MediaCodec resources are fully released
         private const val SCREEN_REFRESH_DELAY_MS = 200L // Delay for encoder to be ready before triggering refresh
         private const val TOTAL_RESTART_REFRESH_DELAY_MS = ENCODER_RESTART_DELAY_MS + SCREEN_REFRESH_DELAY_MS // Total delay for restart + refresh
-        private const val ORIENTATION_POLL_INTERVAL_MS = 500L // Polling interval for orientation changes
 
         /**
          * Main entry point for app_process execution (no MediaProjection).
@@ -141,8 +148,6 @@ class H264Server(
     fun stop() {
         Log.d(TAG, "Stopping H264Server...")
 
-        stopOrientationMonitoring()
-
         // Cancel any pending restart operations and reset the flag
         isRestarting.set(false)
         encoderHandler?.removeCallbacksAndMessages(null)
@@ -206,16 +211,9 @@ class H264Server(
 
     /**
      * Trigger a screen refresh by showing volume UI.
-     * Volume level doesn't matter for remote control, but the UI forces display update.
      */
     fun triggerScreenRefresh() {
-        try {
-            // Press volume down - shows volume UI overlay which forces display update
-            Runtime.getRuntime().exec(arrayOf("input", "keyevent", "KEYCODE_VOLUME_DOWN"))
-            Log.d(TAG, "Triggered screen refresh via volume UI")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to trigger screen refresh: ${e.message}")
-        }
+        displayManager.triggerScreenRefresh()
     }
 
     /**
@@ -251,12 +249,14 @@ class H264Server(
     /**
      * Create VirtualDisplay using either MediaProjection or shell privilege path.
      */
-    @SuppressLint("WrongConstant")
     private fun createVirtualDisplay() {
         Log.d(TAG, "Creating VirtualDisplay (useMediaProjection=$useMediaProjection)...")
 
         // Get display metrics
-        val metrics = getDisplayMetrics()
+        val metrics = displayManager.getDisplayMetrics(
+            defaultWidth = config.width,
+            defaultHeight = config.height
+        )
         val metricsWidth = metrics.widthPixels
         val metricsHeight = metrics.heightPixels
 
@@ -282,23 +282,23 @@ class H264Server(
                     restartEncoder()
                     // Trigger screen refresh after recovery
                     encoderHandler?.postDelayed({
-                        triggerScreenRefresh()
+                        displayManager.triggerScreenRefresh()
                     }, TOTAL_RESTART_REFRESH_DELAY_MS)
                 }
             })
 
             // Start encoder and get input surface
             val inputSurface = encoder?.start(mWidth, mHeight, bitrate, targetFPS, iFrameInterval)
-            if (inputSurface == null) {
-                throw RuntimeException("Failed to start encoder")
-            }
+                ?: throw RuntimeException("Failed to start encoder")
 
-            // Create VirtualDisplay based on mode
-            if (useMediaProjection && mediaProjection != null) {
-                createVirtualDisplayWithMediaProjection(inputSurface)
-            } else {
-                createVirtualDisplayWithShellPrivileges(inputSurface)
-            }
+            displayManager.createVirtualDisplay(
+                name = "GADSScreenCapture",
+                width = mWidth,
+                height = mHeight,
+                density = mDensity,
+                surface = inputSurface,
+                handler = encoderHandler
+            )
 
             Log.d(TAG, "VirtualDisplay and encoder created successfully")
 
@@ -309,241 +309,16 @@ class H264Server(
     }
 
     /**
-     * Create VirtualDisplay using MediaProjection (Activity mode).
-     */
-    private fun createVirtualDisplayWithMediaProjection(inputSurface: Surface) {
-        if (mediaProjection == null) {
-            throw IllegalStateException("MediaProjection is null but useMediaProjection=true")
-        }
-
-        mVirtualDisplay = mediaProjection.createVirtualDisplay(
-            "GADSScreenCapture",
-            mWidth,
-            mHeight,
-            mDensity,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
-            inputSurface,
-            null,
-            encoderHandler
-        )
-
-        Log.d(TAG, "VirtualDisplay created via MediaProjection")
-    }
-
-    // SurfaceControl display token (for fallback)
-    private var surfaceControlDisplay: android.os.IBinder? = null
-
-    // Orientation monitoring
-    private var orientationMonitorThread: Thread? = null
-    @Volatile
-    private var monitoringOrientation = false
-
-    // Restart guard to prevent race conditions
-    private var isRestarting = AtomicBoolean(false)
-
-    /**
-     * Create VirtualDisplay using hidden APIs (app_process mode).
-     * Simple scrcpy approach: try DisplayManager, fallback to SurfaceControl.
-     * Reference: scrcpy ScreenCapture.java lines 127-144
-     */
-    private fun createVirtualDisplayWithShellPrivileges(inputSurface: Surface) {
-        // Try DisplayManager approach (preferred) - scrcpy's simple method
-        Log.d(TAG, "Attempting DisplayManager.createVirtualDisplay()...")
-        mVirtualDisplay = DisplayManagerWrapper.createVirtualDisplay(
-            name = "GADSScreenCapture",
-            width = mWidth,
-            height = mHeight,
-            displayIdToMirror = 0,  // Default display
-            surface = inputSurface
-        )
-
-        if (mVirtualDisplay != null) {
-            Log.d(TAG, "✓ VirtualDisplay created via DisplayManager")
-            startOrientationMonitoring()
-            return
-        }
-
-        // Fallback to SurfaceControl
-        Log.w(TAG, "DisplayManager failed, trying SurfaceControl...")
-        createVirtualDisplayWithSurfaceControl(inputSurface)
-    }
-
-    /**
-     * Fallback: Create display using SurfaceControl (lower-level API).
-     * This works on older Android versions or when DisplayManager fails.
-     */
-    private fun createVirtualDisplayWithSurfaceControl(inputSurface: Surface) {
-        try {
-            val displayToken = com.gads.settings.server.wrappers.SurfaceControlWrapper.createDisplay(
-                "GADSScreenCapture",
-                secure = false
-            )
-
-            if (displayToken == null) {
-                throw RuntimeException("SurfaceControl.createDisplay() returned null")
-            }
-
-            surfaceControlDisplay = displayToken
-
-            // Get display info for layer stack
-            val metrics = getDisplayMetrics()
-            val layerStack = 0 // Default display layer stack
-
-            // Configure the display in a transaction
-            com.gads.settings.server.wrappers.SurfaceControlWrapper.openTransaction()
-            try {
-                // Set the surface to render to
-                com.gads.settings.server.wrappers.SurfaceControlWrapper.setDisplaySurface(displayToken, inputSurface)
-
-                // Set the projection (maps source rect to display rect)
-                val sourceRect = android.graphics.Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
-                val displayRect = android.graphics.Rect(0, 0, mWidth, mHeight)
-                com.gads.settings.server.wrappers.SurfaceControlWrapper.setDisplayProjection(
-                    displayToken,
-                    orientation = 0, // 0 degrees rotation
-                    layerStackRect = sourceRect,
-                    displayRect = displayRect
-                )
-
-                // Set the layer stack
-                com.gads.settings.server.wrappers.SurfaceControlWrapper.setDisplayLayerStack(displayToken, layerStack)
-
-                Log.d(TAG, "SurfaceControl display configured: ${mWidth}x${mHeight}")
-            } finally {
-                com.gads.settings.server.wrappers.SurfaceControlWrapper.closeTransaction()
-            }
-
-            Log.d(TAG, "VirtualDisplay created via SurfaceControl (fallback)")
-
-            // Start monitoring orientation changes for SurfaceControl too
-            startOrientationMonitoring()
-
-        } catch (e: Exception) {
-            Log.e(TAG, "SurfaceControl fallback also failed", e)
-            e.printStackTrace()
-            throw RuntimeException("Both DisplayManager and SurfaceControl approaches failed. Cannot create display. Error: ${e.message}", e)
-        }
-    }
-
-    /**
-     * Get display metrics from context or via reflection.
-     */
-    private fun getDisplayMetrics(): DisplayMetrics {
-        // If context is available, use it
-        if (context != null) {
-            val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-            val display = windowManager.defaultDisplay
-            val metrics = DisplayMetrics()
-            display.getRealMetrics(metrics)
-            return metrics
-        }
-
-        // Otherwise, use reflection (for app_process mode)
-        val metrics = DisplayManagerWrapper.getDisplayInfo(displayId = 0)
-        if (metrics != null) {
-            return metrics
-        }
-
-        // Fallback to default
-        Log.w(TAG, "Could not get display metrics, using defaults")
-        return DisplayMetrics().apply {
-            widthPixels = config.width
-            heightPixels = config.height
-            densityDpi = 240
-        }
-    }
-
-
-    /**
-     * Start orientation monitoring.
-     *
-     * Android 14+ has broken DisplayListener, so we use polling as a reliable fallback.
-     * Reference: scrcpy DisplaySizeMonitor.java lines 24-28
-     */
-    private fun startOrientationMonitoring() {
-        // For now, use simple polling approach (works on all Android versions)
-        // TODO: Implement DisplayWindowListener for Android 14+ (requires WindowManager wrapper)
-
-        val initialMetrics = getDisplayMetrics()
-        var lastWidth = initialMetrics.widthPixels
-        var lastHeight = initialMetrics.heightPixels
-
-        monitoringOrientation = true
-        orientationMonitorThread = Thread {
-            Log.d(TAG, "Orientation monitoring started (polling every ${ORIENTATION_POLL_INTERVAL_MS}ms)")
-
-            while (monitoringOrientation) {
-                try {
-                    Thread.sleep(ORIENTATION_POLL_INTERVAL_MS)
-
-                    val metrics = getDisplayMetrics()
-                    val currentWidth = metrics?.widthPixels ?: lastWidth
-                    val currentHeight = metrics?.heightPixels ?: lastHeight
-
-                    // Check if dimensions changed (rotation occurred)
-                    if (currentWidth != lastWidth || currentHeight != lastHeight) {
-                        Log.d(TAG, "Display size changed: ${lastWidth}x${lastHeight} -> ${currentWidth}x${currentHeight}")
-                        Log.d(TAG, "Restarting encoder for new orientation...")
-
-                        lastWidth = currentWidth
-                        lastHeight = currentHeight
-
-                        // Use restartEncoder() to benefit from race condition protection
-                        restartEncoder()
-
-                        // Trigger screen refresh after encoder restart to get immediate frame
-                        encoderHandler?.postDelayed({
-                            triggerScreenRefresh()
-                        }, TOTAL_RESTART_REFRESH_DELAY_MS)
-                    }
-                } catch (e: InterruptedException) {
-                    break
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error in orientation monitoring", e)
-                }
-            }
-
-            Log.d(TAG, "Orientation monitoring stopped")
-        }
-        orientationMonitorThread?.start()
-    }
-
-    /**
-     * Stop orientation monitoring.
-     */
-    private fun stopOrientationMonitoring() {
-        monitoringOrientation = false
-        orientationMonitorThread?.interrupt()
-        orientationMonitorThread = null
-        Log.d(TAG, "Orientation monitoring stopped")
-    }
-
-    /**
      * Release encoder and virtual display resources.
      */
     private fun releaseEncoder() {
         try {
-            // Stop orientation monitoring first to prevent it from triggering another restart
-            stopOrientationMonitoring()
-
             // Release the encoder
             encoder?.release()
             encoder = null
 
-            // Release VirtualDisplay (if using DisplayManager approach)
-            mVirtualDisplay?.release()
-            mVirtualDisplay = null
-
-            // Release SurfaceControl display (if using SurfaceControl fallback)
-            surfaceControlDisplay?.let {
-                try {
-                    com.gads.settings.server.wrappers.SurfaceControlWrapper.destroyDisplay(it)
-                    Log.d(TAG, "SurfaceControl display destroyed")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error destroying SurfaceControl display", e)
-                }
-            }
-            surfaceControlDisplay = null
+            // Release VirtualDisplay and SurfaceControl resources
+            displayManager.release()
 
             Log.d(TAG, "Encoder released")
         } catch (e: Exception) {
