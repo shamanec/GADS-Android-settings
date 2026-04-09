@@ -409,7 +409,7 @@ class WebRTCScreenCaptureService : Service() {
                 val audioConstraints = MediaConstraints().apply {
                     mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "false"))
                     mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "false"))
-                    mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "false"))
+                    mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
                 }
                 localAudioSource = peerConnectionFactory.makeAudioSource(audioConstraints)
                 localAudioTrack = peerConnectionFactory.makeAudioTrack(localAudioSource!!, "audio0")

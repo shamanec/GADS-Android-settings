@@ -4,6 +4,7 @@ import android.Manifest
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 import androidx.annotation.RequiresPermission
 
@@ -23,6 +24,7 @@ class AudioCapturer(
     private val audioFormat: Int = AudioFormat.ENCODING_PCM_16BIT
 ) {
     private var audioRecord: AudioRecord? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
     private var isCapturing = false
     private var captureThread: Thread? = null
 
@@ -75,6 +77,14 @@ class AudioCapturer(
                 audioRecord?.release()
                 audioRecord = null
                 return
+            }
+
+            if (NoiseSuppressor.isAvailable()) {
+                noiseSuppressor = NoiseSuppressor.create(audioRecord!!.audioSessionId)
+                noiseSuppressor?.enabled = true
+                Log.i(TAG, "NoiseSuppressor enabled (session=${audioRecord!!.audioSessionId})")
+            } else {
+                Log.w(TAG, "NoiseSuppressor not available on this device")
             }
 
             audioRecord?.startRecording()
@@ -153,8 +163,10 @@ class AudioCapturer(
             captureThread?.join(1000)
             captureThread = null
 
-            // Stop and release AudioRecord
+            // Stop and release AudioRecord and effects
             audioRecord?.stop()
+            noiseSuppressor?.release()
+            noiseSuppressor = null
             audioRecord?.release()
             audioRecord = null
 
