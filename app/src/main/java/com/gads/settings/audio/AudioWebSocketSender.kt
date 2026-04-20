@@ -67,6 +67,9 @@ class AudioWebSocketSender(private val port: Int = 1992) {
                 }
             }
 
+            // Allow rebind during kernel TIME_WAIT after AudioService reset; otherwise
+            // the next start() throws BindException and leaves port 1992 unbound.
+            webSocketServer?.isReuseAddr = true
             webSocketServer?.start()
             Log.i(TAG, "Starting audio WebSocket server on port $port")
 
