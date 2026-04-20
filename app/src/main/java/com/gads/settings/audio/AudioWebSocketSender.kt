@@ -19,6 +19,7 @@ class AudioWebSocketSender(private val port: Int = 1992) {
     private var webSocketServer: WebSocketServer? = null
     private var audioClient: WebSocket? = null
     private var isRunning = false
+    private var droppedFrames = 0
 
     companion object {
         private const val TAG = "AudioWebSocketSender"
@@ -86,10 +87,15 @@ class AudioWebSocketSender(private val port: Int = 1992) {
     fun sendAudioFrame(pcmData: ByteArray, pts: Long) {
         val client = audioClient
         if (client == null || !client.isOpen) {
-            // Client not connected - silently skip
-            // (Don't spam logs, this is normal during startup)
+            droppedFrames++
+            // Rate-limit: log first occurrence and then every 1000 drops (~20s @50fps)
+            // to surface silent-stream regressions without spamming during startup.
+            if (droppedFrames == 1 || droppedFrames % 1000 == 0) {
+                Log.w(TAG, "Dropping PCM frame: no connected audio client (total=$droppedFrames)")
+            }
             return
         }
+        droppedFrames = 0
 
         try {
             // Create buffer: [8 bytes PTS][PCM data]
