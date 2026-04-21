@@ -5,12 +5,15 @@ import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.util.Log
+import androidx.core.content.ContextCompat
 
 /**
  * Requests MediaProjection permission for internal audio capture (AudioPlaybackCapture).
  *
- * Shows the system screen recording dialog, obtains the MediaProjection token,
- * and stores it in MediaProjectionHolder. AudioService picks it up via getOrListen().
+ * Shows the system screen recording dialog and, on approval, forwards the resultCode +
+ * data Intent to AudioService via startForegroundService. Android 14+ requires
+ * getMediaProjection() to be called while an active foreground service of type
+ * mediaProjection is running — AudioService is that owner.
  *
  * Triggered by the Go provider via:
  *   adb shell am start -n com.gads.settings/.audio.AudioProjectionActivity
@@ -30,10 +33,12 @@ class AudioProjectionActivity : Activity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (requestCode == REQUEST_CODE && resultCode == RESULT_OK && data != null) {
-            val mpManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            val mp = mpManager.getMediaProjection(resultCode, data)
-            MediaProjectionHolder.set(mp)
-            Log.i(TAG, "MediaProjection obtained for internal audio capture")
+            val serviceIntent = Intent(this, AudioService::class.java).apply {
+                putExtra(AudioService.EXTRA_MP_RESULT_CODE, resultCode)
+                putExtra(AudioService.EXTRA_MP_DATA, data)
+            }
+            ContextCompat.startForegroundService(this, serviceIntent)
+            Log.i(TAG, "Forwarded MediaProjection token payload to AudioService")
         } else {
             Log.w(TAG, "MediaProjection permission denied or cancelled (resultCode=$resultCode)")
         }
