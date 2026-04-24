@@ -53,17 +53,34 @@ class InternalAudioCapturer(
         val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, audioFormat)
         val actualBufferSize = maxOf(bufferSize, minBufferSize)
 
-        audioRecord = AudioRecord.Builder()
-            .setAudioPlaybackCaptureConfig(config)
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                    .setEncoding(audioFormat)
+        val retryDelaysMs = longArrayOf(150, 300, 600)
+        var lastException: UnsupportedOperationException? = null
+        var record: AudioRecord? = null
+        for (delayMs in retryDelaysMs) {
+            try {
+                record = AudioRecord.Builder()
+                    .setAudioPlaybackCaptureConfig(config)
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                            .setEncoding(audioFormat)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(actualBufferSize)
                     .build()
-            )
-            .setBufferSizeInBytes(actualBufferSize)
-            .build()
+                break
+            } catch (e: UnsupportedOperationException) {
+                lastException = e
+                Log.w(TAG, "AudioPlaybackCapture failed (audio policy conflict), retrying in ${delayMs}ms: ${e.message}")
+                Thread.sleep(delayMs)
+            }
+        }
+        if (record == null) {
+            Log.e(TAG, "AudioPlaybackCapture unavailable after ${retryDelaysMs.size} attempts: ${lastException?.message}")
+            return
+        }
+        audioRecord = record
 
         if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
             Log.e(TAG, "AudioRecord for internal capture failed to initialize")

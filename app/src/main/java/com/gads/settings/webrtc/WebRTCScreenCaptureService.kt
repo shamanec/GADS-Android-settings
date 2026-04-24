@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.SensorManager
 import android.view.Display
@@ -18,8 +19,9 @@ import android.os.Looper
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
+import androidx.core.app.ServiceCompat
 import androidx.core.util.Pair
-import com.gads.settings.audio.InternalAudioCapturer
+import com.gads.settings.audio.AudioService
 import com.gads.settings.audio.MediaProjectionHolder
 import com.gads.settings.webrtc.peer.StreamPeerConnection
 import com.gads.settings.webrtc.peer.StreamPeerConnectionFactory
@@ -106,6 +108,12 @@ class WebRTCScreenCaptureService : Service() {
     // Capture state
     @Volatile
     private var isCaptureRunning = false
+    @Volatile
+    private var isRestartingForKeyframe = false
+    // Incremented on every startProjection() call. Captured by each mediaProjectionCallback closure
+    // so that callbacks from previous sessions cannot clear isCaptureRunning after a new session starts.
+    @Volatile
+    private var captureGeneration = 0
     private val captureMutex = Mutex()
 
     // Android 14+: Flag to indicate projection was invalidated and needs re-authorization
@@ -121,9 +129,9 @@ class WebRTCScreenCaptureService : Service() {
     private var localAudioSource: AudioSource? = null
     private var localAudioTrack: AudioTrack? = null
 
-    // Internal audio: data channel + capturer (used when audioInputType == "internal", API 29+)
+    // Internal audio: data channel (used when audioInputType == "internal", API 29+)
+    // PCM frames come from AudioService.onPcmFrame — no second InternalAudioCapturer here.
     private var audioDataChannel: DataChannel? = null
-    private var internalAudioCapturer: InternalAudioCapturer? = null
 
     // FPS constant
     private val TARGET_FPS = 30
@@ -401,8 +409,16 @@ class WebRTCScreenCaptureService : Service() {
             val notification: Pair<Int, Notification> = WebRTCNotificationUtils.getNotification(
                 this
             )
-            startForeground(notification.first, notification.second)
-            logBuffer("Foreground service started")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val fgsType = if (audioStreamEnabled && audioInputType == "microphone")
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                else
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                ServiceCompat.startForeground(this, notification.first, notification.second, fgsType)
+            } else {
+                startForeground(notification.first, notification.second)
+            }
+            logBuffer("Foreground service started (type: audioInputType=$audioInputType)")
 
             // Setup microphone audio track; internal audio uses a DataChannel set up in sendAnswer()
             if (audioStreamEnabled && audioInputType == "microphone" && !audioInitialized) {
@@ -453,8 +469,7 @@ class WebRTCScreenCaptureService : Service() {
         localAudioSource = null
 
         // Release internal audio resources
-        internalAudioCapturer?.stopCapture()
-        internalAudioCapturer = null
+        AudioService.onPcmFrame = null
         audioDataChannel?.close()
         audioDataChannel?.dispose()
         audioDataChannel = null
@@ -636,6 +651,7 @@ class WebRTCScreenCaptureService : Service() {
      */
     private suspend fun sendAnswer() {
         logConn("sendAnswer (buffer ready: $firstFrameCaptured)")
+        Log.d("GADS-Audio-Debug", "sendAnswer: audioStreamEnabled=$audioStreamEnabled audioInputType=$audioInputType")
 
         if (!::localVideoTrack.isInitialized) {
             Log.e(TAG_CONN, "sendAnswer: localVideoTrack is not initialized!")
@@ -645,11 +661,15 @@ class WebRTCScreenCaptureService : Service() {
         peerConnection?.connection?.setRemoteDescription(object : org.webrtc.SdpObserver {
             override fun onSetSuccess() {
                 val mediaStreamLabels = listOf("ARDAMS")
+                Log.d("GADS-Audio-Debug", "addTrack: localAudioTrack=${if (localAudioTrack != null) "present" else "null"}")
                 peerConnection?.connection?.addTrack(localVideoTrack, mediaStreamLabels)
                 localAudioTrack?.let { peerConnection?.connection?.addTrack(it, mediaStreamLabels) }
 
                 // For internal audio: create a negotiated data channel to send raw PCM to the browser.
                 // Browser creates the same channel (id=42, negotiated) and plays via AudioContext.
+                // PCM frames come from AudioService (which already holds the single InternalAudioCapturer)
+                // via the static onPcmFrame callback — avoids creating a second AudioRecord on the same
+                // MediaProjection token (would fail with "could not register audio policy").
                 if (audioStreamEnabled && audioInputType == "internal" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val init = DataChannel.Init().apply {
                         negotiated = true
@@ -657,14 +677,10 @@ class WebRTCScreenCaptureService : Service() {
                         ordered = true
                     }
                     audioDataChannel = peerConnection?.connection?.createDataChannel("audio", init)
-                    MediaProjectionHolder.getOrListen { mp ->
-                        val capturer = InternalAudioCapturer(mp)
-                        internalAudioCapturer = capturer
-                        capturer.startCapture { pcmData, _ ->
-                            val channel = audioDataChannel ?: return@startCapture
-                            if (channel.state() == DataChannel.State.OPEN) {
-                                channel.send(DataChannel.Buffer(ByteBuffer.wrap(pcmData), true))
-                            }
+                    AudioService.onPcmFrame = { pcmData ->
+                        val channel = audioDataChannel
+                        if (channel != null && channel.state() == DataChannel.State.OPEN) {
+                            channel.send(DataChannel.Buffer(ByteBuffer.wrap(pcmData), true))
                         }
                     }
                 }
@@ -678,6 +694,12 @@ class WebRTCScreenCaptureService : Service() {
 
                 peerConnection?.connection?.createAnswer(object : org.webrtc.SdpObserver {
                     override fun onCreateSuccess(answer: SessionDescription?) {
+                        val audioMLine = answer?.description
+                            ?.lines()
+                            ?.dropWhile { !it.startsWith("m=audio") }
+                            ?.take(10)
+                            ?.joinToString("\n")
+                        Log.d("GADS-Audio-Debug", "createAnswer success — audio m-line section:\n$audioMLine")
                         peerConnection?.connection?.setLocalDescription(object : org.webrtc.SdpObserver {
                             override fun onSetSuccess() {
                                 peerConnection?.connection?.setBitrate(1_000_000, 300_000, 5_000_000)
@@ -797,9 +819,14 @@ class WebRTCScreenCaptureService : Service() {
                     } else {
                         // Android 13 and below: Restart capture (proven to work)
                         logBuffer("Android 13-: Forcing keyframe by restarting capture")
-                        screenCapturer.stopCapture()
-                        delay(50)
-                        screenCapturer.startCapture(streamWidth, streamHeight, TARGET_FPS)
+                        isRestartingForKeyframe = true
+                        try {
+                            screenCapturer.stopCapture()
+                            delay(50)
+                            screenCapturer.startCapture(streamWidth, streamHeight, TARGET_FPS)
+                        } finally {
+                            isRestartingForKeyframe = false
+                        }
                         delay(100)
                         surfaceTextureHelper?.forceFrame()
                     }
@@ -1123,6 +1150,7 @@ class WebRTCScreenCaptureService : Service() {
             return
         }
 
+        val myGeneration = ++captureGeneration
         isCaptureRunning = true
         logBuffer("Starting projection...")
 
@@ -1153,7 +1181,12 @@ class WebRTCScreenCaptureService : Service() {
         val mediaProjectionCallback = object : MediaProjection.Callback() {
             override fun onStop() {
                 logBuffer("MediaProjection stopped")
-                isCaptureRunning = false
+                // Only clear isCaptureRunning if:
+                // 1. This callback belongs to the current capture session (not a stale previous-session callback)
+                // 2. We are not in the middle of a forceKeyframe stop/start cycle
+                if (myGeneration == captureGeneration && !isRestartingForKeyframe) {
+                    isCaptureRunning = false
+                }
 
                 // Android 14+: Mark that we need re-authorization
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -1164,10 +1197,13 @@ class WebRTCScreenCaptureService : Service() {
         }
 
         // Android 14+: Use ResizableScreenCapturer (supports VirtualDisplay.resize)
-        // Android 13-: Use standard ScreenCapturerAndroid
-        screenCapturer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        // Android 13- with internal audio: Also use ResizableScreenCapturer to avoid the GetStream
+        //   SDK's internal MediaProjection.Callback triggering AudioPlaybackCapture recreation on stop,
+        //   which crashes with "could not register audio policy" and kills the process.
+        // Android 13- with microphone: Use standard ScreenCapturerAndroid (safe, no conflict)
+        screenCapturer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE || audioInputType == "internal") {
             val isQualcomm = isQualcommFastEncoder()
-            logBuffer("Creating ResizableScreenCapturer (Qualcomm: $isQualcomm)")
+            logBuffer("Creating ResizableScreenCapturer (Qualcomm: $isQualcomm, internalAudio=${audioInputType == "internal"})")
             ResizableScreenCapturer(data!!, mediaProjectionCallback, isQualcomm)
         } else {
             logBuffer("Android 13-: Using ScreenCapturerAndroid")
@@ -1209,6 +1245,9 @@ class WebRTCScreenCaptureService : Service() {
                 override fun onCapturerStarted(success: Boolean) {
                     capturerObserver.onCapturerStarted(success)
                     logBuffer("Capturer started: $success")
+                    // Restore isCaptureRunning in case a delayed onStop() from a previous projection
+                    // cleared it between startProjection() and the actual VirtualDisplay being created.
+                    if (success) isCaptureRunning = true
                 }
 
                 override fun onCapturerStopped() {
