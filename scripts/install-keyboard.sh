@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build the release APK, install it on a connected Android device,
-# and enable + select the GADS Remote Keyboard IME so it can be tested.
+# Build a release flavor APK, install it on a connected Android device,
+# and enable + select the Remote Keyboard IME so it can be tested.
 #
 # Usage:
-#   scripts/install-keyboard.sh            # uses the only connected device
-#   scripts/install-keyboard.sh <serial>   # targets a specific adb serial
+#   scripts/install-keyboard.sh <flavor>            # gads | hf
+#   scripts/install-keyboard.sh <flavor> <serial>   # also target a specific adb serial
 
 set -euo pipefail
 
@@ -12,13 +12,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-APK_PATH="app/build/outputs/apk/release/gads-settings.apk"
-PACKAGE="com.gads.settings"
-IME_ID="$PACKAGE/.GADSKeyboardIME"
+if [[ $# -lt 1 ]]; then
+    echo "Usage: scripts/install-keyboard.sh <flavor: gads|hf> [adb-serial]" >&2
+    exit 1
+fi
+
+FLAVOR="$1"
+case "$FLAVOR" in
+    gads) PACKAGE="com.gads.settings" ;;
+    hf)   PACKAGE="com.heliofleet.settings" ;;
+    *)
+        echo "Unknown flavor '$FLAVOR'. Expected gads or hf." >&2
+        exit 1
+        ;;
+esac
+
+GRADLE_TASK="assemble$(tr '[:lower:]' '[:upper:]' <<< "${FLAVOR:0:1}")${FLAVOR:1}Release"
+APK_PATH="app/build/outputs/apk/${FLAVOR}/release/${FLAVOR}-settings.apk"
+IME_ID="$PACKAGE/com.gads.settings.GADSKeyboardIME"
 
 ADB_ARGS=()
-if [[ $# -ge 1 ]]; then
-    ADB_ARGS=(-s "$1")
+if [[ $# -ge 2 ]]; then
+    ADB_ARGS=(-s "$2")
 fi
 
 resolve_device() {
@@ -32,7 +47,7 @@ resolve_device() {
         exit 1
     fi
     if [[ "$count" -gt 1 ]]; then
-        echo "Multiple devices connected. Pass a serial: scripts/install-keyboard.sh <serial>" >&2
+        echo "Multiple devices connected. Pass a serial: scripts/install-keyboard.sh $FLAVOR <serial>" >&2
         adb devices >&2
         exit 1
     fi
@@ -40,8 +55,8 @@ resolve_device() {
 
 resolve_device
 
-echo "==> Building release APK"
-./gradlew assembleRelease
+echo "==> Building $FLAVOR release APK ($GRADLE_TASK)"
+./gradlew "$GRADLE_TASK"
 
 if [[ ! -f "$APK_PATH" ]]; then
     echo "Expected APK not found at $APK_PATH" >&2
