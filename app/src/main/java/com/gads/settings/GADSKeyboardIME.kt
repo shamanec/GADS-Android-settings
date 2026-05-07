@@ -1,15 +1,11 @@
 package com.gads.settings
 
-import android.graphics.Color
 import android.inputmethodservice.InputMethodService
 import android.inputmethodservice.Keyboard
 import android.inputmethodservice.KeyboardView
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
 import android.view.View
-import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import io.ktor.http.HttpStatusCode
@@ -36,10 +32,6 @@ class GADSKeyboardIME : InputMethodService(), KeyboardView.OnKeyboardActionListe
     private var keyboard: Keyboard? = null
     private var symbolsKeyboard: Keyboard? = null
     private var isSymbolsKeyboard = false
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var remoteStatusView: TextView? = null
-    private val REMOTE_IDLE_TIMEOUT = 1000L
-    private val remoteIdleRunnable = Runnable { setRemoteActive(false) }
 
     override fun onCreate() {
         super.onCreate()
@@ -116,7 +108,6 @@ class GADSKeyboardIME : InputMethodService(), KeyboardView.OnKeyboardActionListe
         // Create and configure the keyboard view
         val inflatedView = layoutInflater.inflate(R.layout.keyboard_view, null)
         keyboardView = inflatedView.findViewById(R.id.keyboard_view)
-        remoteStatusView = inflatedView.findViewById(R.id.remote_status)
 
         keyboardView?.apply {
             keyboard = if (isSymbolsKeyboard) this@GADSKeyboardIME.symbolsKeyboard else this@GADSKeyboardIME.keyboard
@@ -141,30 +132,8 @@ class GADSKeyboardIME : InputMethodService(), KeyboardView.OnKeyboardActionListe
         return inflatedView
     }
 
-    private fun setRemoteActive(isTyping: Boolean) {
-        remoteStatusView?.apply {
-            if (isTyping) {
-                text = "GADS Remote Kbd: Typing..."
-                setTextColor(Color.parseColor("#FF4CAF50"))
-            } else {
-                text = "GADS Remote Kbd: Active"
-                setTextColor(Color.parseColor("#4CAF50"))
-            }
-        }
-    }
-
-    private fun updateRemoteActivityTimer() {
-        setRemoteActive(true)                       // show green “Typing…”
-        mainHandler.removeCallbacks(remoteIdleRunnable)
-        mainHandler.postDelayed(
-            remoteIdleRunnable,
-            REMOTE_IDLE_TIMEOUT
-        )
-    }
-
     private fun simulateTyping(text: String) {
         GlobalScope.launch(Dispatchers.Main) {
-            updateRemoteActivityTimer()
             for (ch in text) {
                 if (text.length == 1) {
                     highlightIfPresent(ch)
