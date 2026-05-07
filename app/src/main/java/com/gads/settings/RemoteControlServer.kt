@@ -347,15 +347,16 @@ class RemoteControlServer(private val port: Int) {
                         Log.d(logTag, "Getting current device IME")
                         val curIme = exec(("settings get secure default_input_method").trim())
 
-                        Log.d(logTag, "Enabling GADS IME")
-                        exec("ime enable com.gads.settings/.GADSKeyboardIME")
+                        val pkg = BuildConfig.APPLICATION_ID
+                        Log.d(logTag, "Enabling GADS IME ($pkg)")
+                        exec("ime enable $pkg/com.gads.settings.GADSKeyboardIME")
                         Log.d(logTag, "Setting GADS IME as default")
-                        exec("ime set com.gads.settings/.GADSKeyboardIME")
+                        exec("ime set $pkg/com.gads.settings.GADSKeyboardIME")
 
                         // 3. synchronous ordered broadcast: resultData holds Base64 text
                         Log.d(logTag, "Sending broadcast to GADS IME to get clipboard data")
                         val res = exec(
-                            "am broadcast -n com.gads.settings/.ClipboardReceiver -a com.gads.settings.CLIPBOARD_GET"
+                            "am broadcast -n $pkg/com.gads.settings.ClipboardReceiver -a com.gads.settings.CLIPBOARD_GET"
                         )
                         val b64 = Regex("""Broadcast completed: result=.*?data="(.*?)"""")
                             .find(res)?.groupValues?.get(1) ?: ""

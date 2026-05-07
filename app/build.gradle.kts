@@ -12,18 +12,33 @@ android {
     applicationVariants.all {
         outputs.all {
             val outputImpl = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
-            outputImpl.outputFileName = "gads-settings.apk"
+            outputImpl.outputFileName = "${flavorName}-settings.apk"
         }
     }
 
     defaultConfig {
-        applicationId = "com.gads.settings"
         minSdk = 24
         targetSdk = 35
         versionCode = 1
         versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    flavorDimensions += "brand"
+    productFlavors {
+        create("gads") {
+            dimension = "brand"
+            applicationId = "com.gads.settings"
+        }
+        create("hf") {
+            dimension = "brand"
+            applicationId = "com.heliofleet.settings"
+        }
     }
 
     signingConfigs {

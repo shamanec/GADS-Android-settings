@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HF Settings</string>
+    <string name="ime_label">HF Remote Keyboard</string>
+    <string name="app_description">HF Settings application contains the code needed to support remote keyboard typing and screen streaming services.\nIt does nothing by itself when launched!</string>
+</resources>
