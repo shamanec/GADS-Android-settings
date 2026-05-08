@@ -29,7 +29,7 @@ esac
 
 GRADLE_TASK="assemble$(tr '[:lower:]' '[:upper:]' <<< "${FLAVOR:0:1}")${FLAVOR:1}Release"
 APK_PATH="app/build/outputs/apk/${FLAVOR}/release/${FLAVOR}-settings.apk"
-IME_ID="$PACKAGE/com.gads.settings.GADSKeyboardIME"
+IME_ID="$PACKAGE/com.shamanec.settings.RemoteKeyboardIME"
 
 ADB_ARGS=()
 if [[ $# -ge 2 ]]; then

@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.gads.settings"
+    namespace = "com.shamanec.settings"
     compileSdk = 35
 
     applicationVariants.all {
@@ -34,10 +34,12 @@ android {
         create("gads") {
             dimension = "brand"
             applicationId = "com.gads.settings"
+            buildConfigField("String", "LOG_PREFIX", "\"GADS\"")
         }
         create("hf") {
             dimension = "brand"
             applicationId = "com.heliofleet.settings"
+            buildConfigField("String", "LOG_PREFIX", "\"HF\"")
         }
     }
 

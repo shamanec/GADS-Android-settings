@@ -17,7 +17,7 @@
         android:supportsRtl="true">
 
         <service
-            android:name=".GADSKeyboardIME"
+            android:name=".RemoteKeyboardIME"
             android:label="@string/ime_label"
             android:exported="true"
             android:theme="@style/AppTheme"
@@ -95,8 +95,8 @@
 
         <receiver android:name=".ClipboardReceiver" android:exported="true">
             <intent-filter>
-                <action android:name="com.gads.settings.CLIPBOARD_GET"/>
-                <action android:name="com.gads.settings.CLIPBOARD_SET"/>
+                <action android:name="com.shamanec.settings.CLIPBOARD_GET"/>
+                <action android:name="com.shamanec.settings.CLIPBOARD_SET"/>
             </intent-filter>
         </receiver>
     </application>

@@ -7,7 +7,7 @@
     android:paddingTop="6dp"
     android:paddingBottom="6dp">
 
-    <com.gads.settings.HighlightKeyboardView
+    <com.shamanec.settings.HighlightKeyboardView
         android:id="@+id/keyboard_view"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
