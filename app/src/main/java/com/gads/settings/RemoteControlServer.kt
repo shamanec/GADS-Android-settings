@@ -9,7 +9,6 @@ import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyEvent
 import android.view.MotionEvent
-import androidx.annotation.RequiresApi
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
@@ -37,29 +36,29 @@ import android.util.Base64
 /**
  * Function for executing shell commands on the device
  */
-@RequiresApi(Build.VERSION_CODES.O)
 fun exec(
     cmd: String,
     asRoot: Boolean = false,
     timeoutSec: Long = 10
 ): String {
-    // build the command line
     val args = if (asRoot) arrayOf("su", "-c", cmd)
     else arrayOf("sh", "-c", cmd)
 
     val proc = ProcessBuilder(*args)
-        .redirectErrorStream(true)   // merge stderr into stdout
+        .redirectErrorStream(true)
         .start()
 
-    // read output in one go
     val output = BufferedReader(InputStreamReader(proc.inputStream)).use {
         it.readText()
     }
 
-    // wait (with timeout) so we don’t leak processes
-    if (!proc.waitFor(timeoutSec, TimeUnit.SECONDS)) {
-        proc.destroyForcibly()
-        throw RuntimeException("Command timed out: $cmd")
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (!proc.waitFor(timeoutSec, TimeUnit.SECONDS)) {
+            proc.destroyForcibly()
+            throw RuntimeException("Command timed out: $cmd")
+        }
+    } else {
+        proc.waitFor()
     }
 
     return output
@@ -69,10 +68,22 @@ fun exec(
 data class TapRequest(val x: Float, val y: Float)
 
 @Serializable
+data class DoubleTapRequest(val x: Float, val y: Float)
+
+@Serializable
 data class TouchAndHoldRequest(val x: Float, val y: Float, val duration: Long)
 
 @Serializable
 data class SwipeRequest(val x1: Float, val y1: Float, val x2: Float, val y2: Float, val duration: Int = 300)
+
+@Serializable
+data class PinchRequest(
+    val centerX: Float,
+    val centerY: Float,
+    val scale: Float,
+    val duration: Int = 300,
+    val direction: String = "diagonal"
+)
 
 @Serializable
 data class StatusResponse(val status: String, val message: String? = null)
@@ -82,6 +93,13 @@ data class ScreenSizeResponse(val x: Int, val y: Int)
 
 @Serializable
 data class ClipboardResponse(val value: String)
+
+@Serializable
+data class AppInfo(
+    @kotlinx.serialization.SerialName("bundle_identifier") val packageName: String,
+    @kotlinx.serialization.SerialName("app_name") val appName: String,
+    @kotlinx.serialization.SerialName("can_uninstall") val canUninstall: Boolean
+)
 
 @Serializable
 data class AndroidFileNode(
@@ -98,6 +116,7 @@ data class ScreenshotResponse(val screenshot: String)
 /**
  * The ktor server accepting the requests for the remote control and data acquisition
  */
+@SuppressLint("PrivateApi", "DiscouragedPrivateApi")
 class RemoteControlServer(private val port: Int) {
     private val inputInjector = InputInjector()
     private var screenWidth: Int = 0
@@ -106,6 +125,75 @@ class RemoteControlServer(private val port: Int) {
     
     // Cached reflection objects for SurfaceControl screenshot
     private val screenshotMethod: Method?
+
+    // Context resolved via reflection — tries multiple approaches since we run as app_process
+    private val appContext: android.content.Context? by lazy {
+        // Try 1: AppGlobals.getInitialApplication()
+        try {
+            val app = Class.forName("android.app.AppGlobals")
+                .getDeclaredMethod("getInitialApplication")
+                .invoke(null) as? android.app.Application
+            if (app != null) {
+                Log.d(logTag, "Got context via AppGlobals")
+                return@lazy app
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "AppGlobals approach failed: ${e.message}")
+        }
+
+        // Try 2: ActivityThread.currentApplication()
+        try {
+            val app = Class.forName("android.app.ActivityThread")
+                .getDeclaredMethod("currentApplication")
+                .invoke(null) as? android.app.Application
+            if (app != null) {
+                Log.d(logTag, "Got context via ActivityThread.currentApplication()")
+                return@lazy app
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "ActivityThread.currentApplication() approach failed: ${e.message}")
+        }
+
+        // Try 3: ActivityThread.currentActivityThread().getSystemContext()
+        try {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val thread = atClass.getDeclaredMethod("currentActivityThread").invoke(null)
+            if (thread != null) {
+                val ctx = atClass.getDeclaredMethod("getSystemContext").invoke(thread) as? android.content.Context
+                if (ctx != null) {
+                    Log.d(logTag, "Got context via ActivityThread.currentActivityThread().getSystemContext()")
+                    return@lazy ctx
+                }
+                val app = atClass.getDeclaredMethod("getApplication").invoke(thread) as? android.app.Application
+                if (app != null) {
+                    Log.d(logTag, "Got context via ActivityThread.currentActivityThread().getApplication()")
+                    return@lazy app
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "ActivityThread.currentActivityThread() approach failed: ${e.message}")
+        }
+
+        // Try 4: ActivityThread.systemMain().getSystemContext()
+        try {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val thread = atClass.getDeclaredMethod("systemMain").invoke(null)
+            val ctx = atClass.getDeclaredMethod("getSystemContext").invoke(thread) as? android.content.Context
+            if (ctx != null) {
+                Log.d(logTag, "Got context via ActivityThread.systemMain()")
+                return@lazy ctx
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "ActivityThread.systemMain() approach failed: ${e.message}")
+        }
+
+        Log.e(logTag, "All context resolution approaches failed")
+        null
+    }
+
+    private val packageManager: android.content.pm.PackageManager? by lazy {
+        appContext?.packageManager
+    }
 
     init {
         // Initialize SurfaceControl reflection
@@ -165,6 +253,23 @@ class RemoteControlServer(private val port: Int) {
                     }
                 }
 
+                post("/doubleTap") {
+                    try {
+                        val request = call.receive<DoubleTapRequest>()
+                        try {
+                            Log.d(logTag, "Attempting to perform double tap action at coordinates `${request.x}:${request.y}`")
+                            inputInjector.doubleTap(request.x, request.y)
+                            call.respond(HttpStatusCode.OK, StatusResponse("success", "Successfully performed double tap action"))
+                        } catch (e: Exception) {
+                            Log.e(logTag, "Internal error performing double tap action: ${e.message}")
+                            call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed performing double tap action - ${e.message}"))
+                        }
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Bad request performing double tap action: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid double tap request - ${e.message}"))
+                    }
+                }
+
                 post("/touchAndHold") {
                     try {
                         val request = call.receive<TouchAndHoldRequest>()
@@ -206,6 +311,24 @@ class RemoteControlServer(private val port: Int) {
                     } catch (e: Exception) {
                         Log.e(logTag, "Bad request performing swipe action: ${e.message}")
                         call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid swipe request - ${e.message}"))
+                    }
+                }
+
+                post("/pinch") {
+                    try {
+                        val request = call.receive<PinchRequest>()
+                        Log.d(logTag, "Performing pinch at (${request.centerX}, ${request.centerY}) scale=${request.scale}")
+
+                        try {
+                            inputInjector.pinch(request.centerX, request.centerY, request.scale, request.duration, request.direction)
+                            call.respond(HttpStatusCode.OK, StatusResponse("success", "Pinch executed successfully"))
+                        } catch (e: Exception) {
+                            Log.e(logTag, "Failed to execute pinch: ${e.message}")
+                            call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Pinch failed - ${e.message}"))
+                        }
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Invalid pinch request: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid request - ${e.message}"))
                     }
                 }
 
@@ -348,6 +471,17 @@ class RemoteControlServer(private val port: Int) {
                 get("/ping") {
                     call.respond(HttpStatusCode.OK)
                 }
+
+                get("/installed-apps") {
+                    try {
+                        val installedApps = getInstalledApps()
+                        val filtered = installedApps.filterNot { it.packageName.contains("com.gads") }.filterNot { it.packageName.contains("com.shamanec") }
+                        call.respond(HttpStatusCode.OK, filtered)
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Internal error getting installed apps: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed getting installed apps - ${e.message}"))
+                    }
+                }
             }
         }.start(wait = true)
     }
@@ -413,10 +547,77 @@ class RemoteControlServer(private val port: Int) {
         return outputStream.toByteArray()
     }
 
-    private fun scaleDown(bitmap: Bitmap, scaleFactor: Int): Bitmap {
-        val newWidth = bitmap.width / scaleFactor
-        val newHeight = bitmap.height / scaleFactor
-        return Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
+    private fun getInstalledApps(): List<AppInfo> {
+        val pm = packageManager
+        if (pm != null) {
+            return pm.getInstalledApplications(android.content.pm.PackageManager.GET_META_DATA)
+                .filter { it.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM == 0 }
+                .map { AppInfo(packageName = it.packageName, appName = pm.getApplicationLabel(it).toString(), canUninstall = true) }
+                .sortedBy { it.appName }
+        }
+
+        // Fallback: use IPackageManager binder directly via ServiceManager
+        Log.w(logTag, "PackageManager unavailable, trying IPackageManager binder")
+        val ipm = getIPackageManager()
+        if (ipm != null) {
+            return exec("pm list packages -3")
+                .lines()
+                .mapNotNull { line ->
+                    val pkg = line.removePrefix("package:").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                    val appName = resolveAppLabel(ipm, pkg) ?: pkg
+                    AppInfo(packageName = pkg, appName = appName, canUninstall = true)
+                }
+                .sortedBy { it.appName }
+        }
+
+        // Last resort: package names only
+        Log.w(logTag, "IPackageManager unavailable, returning package names only")
+        return exec("pm list packages -3")
+            .lines()
+            .mapNotNull { line ->
+                val pkg = line.removePrefix("package:").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                AppInfo(packageName = pkg, appName = pkg, canUninstall = true)
+            }
+            .sortedBy { it.packageName }
+    }
+
+    @SuppressLint("DiscouragedPrivateApi", "PrivateApi")
+    private fun getIPackageManager(): Any? {
+        return try {
+            val binder = Class.forName("android.os.ServiceManager")
+                .getDeclaredMethod("getService", String::class.java)
+                .invoke(null, "package") as? android.os.IBinder ?: return null
+            Class.forName("android.content.pm.IPackageManager\$Stub")
+                .getDeclaredMethod("asInterface", android.os.IBinder::class.java)
+                .invoke(null, binder)
+        } catch (e: Exception) {
+            Log.w(logTag, "IPackageManager binder unavailable: ${e.message}")
+            null
+        }
+    }
+
+    @SuppressLint("DiscouragedPrivateApi")
+    private fun resolveAppLabel(ipm: Any, packageName: String): String? {
+        return try {
+            val appInfo = ipm.javaClass
+                .getMethod("getApplicationInfo", String::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                .invoke(ipm, packageName, 0, 0) as? android.content.pm.ApplicationInfo
+                ?: return null
+            // nonLocalizedLabel is set when the manifest uses a hardcoded string (no resource needed)
+            appInfo.nonLocalizedLabel?.toString()
+                ?: run {
+                    // Load label from APK resources without a Context
+                    val am = android.content.res.AssetManager::class.java.newInstance()
+                    android.content.res.AssetManager::class.java
+                        .getDeclaredMethod("addAssetPath", String::class.java)
+                        .apply { isAccessible = true }
+                        .invoke(am, appInfo.publicSourceDir)
+                    @Suppress("DEPRECATION")
+                    android.content.res.Resources(am, null, null).getString(appInfo.labelRes)
+                }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun getFiles(): AndroidFileNode {
@@ -599,6 +800,40 @@ class InputInjector {
     }
 
     /**
+     * Inject double tap event at coordinates with Android framework-compliant timing
+     */
+    fun doubleTap(x: Float, y: Float) {
+        // First tap
+        val time1 = SystemClock.uptimeMillis()
+        val down1 = MotionEvent.obtain(time1, time1, MotionEvent.ACTION_DOWN, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        val up1 = MotionEvent.obtain(time1, time1 + 10, MotionEvent.ACTION_UP, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        injectEvent(down1)
+        injectEvent(up1)
+        down1.recycle()
+        up1.recycle()
+
+        // Wait within the double tap window (40ms < 50ms < 300ms)
+        Thread.sleep(50)
+
+        // Second tap
+        val time2 = SystemClock.uptimeMillis()
+        val down2 = MotionEvent.obtain(time2, time2, MotionEvent.ACTION_DOWN, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        val up2 = MotionEvent.obtain(time2, time2 + 10, MotionEvent.ACTION_UP, x, y, 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        injectEvent(down2)
+        injectEvent(up2)
+        down2.recycle()
+        up2.recycle()
+    }
+
+    /**
      * Inject touch&hold event at coordinates
      */
     fun touchAndHoldAsync(
@@ -684,6 +919,148 @@ class InputInjector {
         down.recycle()
         up.recycle()
     }
+
+    fun pinch(centerX: Float, centerY: Float, scale: Float, duration: Int, direction: String = "diagonal") {
+        val startTime = SystemClock.uptimeMillis()
+
+        val baseDistance = 200f
+        val startDistance = if (scale < 1.0f) baseDistance else baseDistance / scale
+        val endDistance = if (scale < 1.0f) baseDistance * scale else baseDistance
+
+        val pointerProp1 = MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = MotionEvent.TOOL_TYPE_FINGER
+        }
+        val pointerProp2 = MotionEvent.PointerProperties().apply {
+            id = 1
+            toolType = MotionEvent.TOOL_TYPE_FINGER
+        }
+        val props = arrayOf(pointerProp1, pointerProp2)
+
+        val (startX1, startY1, startX2, startY2) = when (direction) {
+            "horizontal" -> arrayOf(
+                centerX - startDistance, centerY,
+                centerX + startDistance, centerY
+            )
+            "vertical" -> arrayOf(
+                centerX, centerY - startDistance,
+                centerX, centerY + startDistance
+            )
+            else -> arrayOf(
+                centerX - startDistance, centerY - startDistance,
+                centerX + startDistance, centerY + startDistance
+            )
+        }
+
+        val startCoords1 = MotionEvent.PointerCoords().apply {
+            x = startX1
+            y = startY1
+            pressure = 1f
+            size = 1f
+        }
+        val startCoords2 = MotionEvent.PointerCoords().apply {
+            x = startX2
+            y = startY2
+            pressure = 1f
+            size = 1f
+        }
+
+        val down1 = MotionEvent.obtain(
+            startTime, startTime,
+            MotionEvent.ACTION_DOWN,
+            1, arrayOf(pointerProp1), arrayOf(startCoords1),
+            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+        )
+        injectEvent(down1)
+        down1.recycle()
+
+        val down2 = MotionEvent.obtain(
+            startTime, startTime,
+            MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2, props, arrayOf(startCoords1, startCoords2),
+            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+        )
+        injectEvent(down2)
+        down2.recycle()
+
+        val (endX1, endY1, endX2, endY2) = when (direction) {
+            "horizontal" -> arrayOf(
+                centerX - endDistance, centerY,
+                centerX + endDistance, centerY
+            )
+            "vertical" -> arrayOf(
+                centerX, centerY - endDistance,
+                centerX, centerY + endDistance
+            )
+            else -> arrayOf(
+                centerX - endDistance, centerY - endDistance,
+                centerX + endDistance, centerY + endDistance
+            )
+        }
+
+        val steps = maxOf(duration / 10, 20)
+
+        for (i in 1..steps) {
+            val eventTime = startTime + (i * duration / steps)
+            val progress = i.toFloat() / steps
+
+            val coords1 = MotionEvent.PointerCoords().apply {
+                x = startX1 + (endX1 - startX1) * progress
+                y = startY1 + (endY1 - startY1) * progress
+                pressure = 1f
+                size = 1f
+            }
+            val coords2 = MotionEvent.PointerCoords().apply {
+                x = startX2 + (endX2 - startX2) * progress
+                y = startY2 + (endY2 - startY2) * progress
+                pressure = 1f
+                size = 1f
+            }
+
+            val move = MotionEvent.obtain(
+                startTime, eventTime,
+                MotionEvent.ACTION_MOVE,
+                2, props, arrayOf(coords1, coords2),
+                0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+            )
+            injectEvent(move)
+            move.recycle()
+
+            Thread.sleep((duration / steps).toLong())
+        }
+
+        val endCoords1 = MotionEvent.PointerCoords().apply {
+            x = endX1
+            y = endY1
+            pressure = 1f
+            size = 1f
+        }
+        val endCoords2 = MotionEvent.PointerCoords().apply {
+            x = endX2
+            y = endY2
+            pressure = 1f
+            size = 1f
+        }
+
+        val endTime = startTime + duration
+        val up2 = MotionEvent.obtain(
+            startTime, endTime,
+            MotionEvent.ACTION_POINTER_UP or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2, props, arrayOf(endCoords1, endCoords2),
+            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+        )
+        injectEvent(up2)
+        up2.recycle()
+
+        val up1 = MotionEvent.obtain(
+            startTime, endTime,
+            MotionEvent.ACTION_UP,
+            1, arrayOf(pointerProp1), arrayOf(endCoords1),
+            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+        )
+        injectEvent(up1)
+        up1.recycle()
+    }
 }
 
 fun main(args: Array<String>) {
@@ -696,8 +1073,10 @@ fun main(args: Array<String>) {
         Log.i(logTag, "Starting GADS remote control server on port `$port`...")
         Log.i(logTag, "Endpoints:")
         Log.i(logTag, "POST /tap ${jsonFormatter.encodeToString(TapRequest.serializer(), TapRequest(x = 100f, y = 200f))}")
+        Log.i(logTag, "POST /doubleTap ${jsonFormatter.encodeToString(DoubleTapRequest.serializer(), DoubleTapRequest(x = 100f, y = 200f))}")
         Log.i(logTag, "POST /swipe ${jsonFormatter.encodeToString(SwipeRequest.serializer(), SwipeRequest(x1 = 100f, y1 = 200f, x2 = 100f, y2 = 200f, duration = 1000))}")
         Log.i(logTag, "POST /touchAndHold ${jsonFormatter.encodeToString(TouchAndHoldRequest.serializer(), TouchAndHoldRequest(x = 100f, y = 200f, duration = 1000))}")
+        Log.i(logTag, "POST /pinch ${jsonFormatter.encodeToString(PinchRequest.serializer(), PinchRequest(centerX = 500f, centerY = 800f, scale = 2.0f, duration = 300, direction = "diagonal"))}")
         Log.i(logTag, "GET /screen-size")
         Log.i(logTag, "POST /clipboard")
         Log.i(logTag, "POST /home")
