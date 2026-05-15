@@ -32,6 +32,7 @@ class RemoteKeyboardIME : InputMethodService(), KeyboardView.OnKeyboardActionLis
     private var keyboard: Keyboard? = null
     private var symbolsKeyboard: Keyboard? = null
     private var isSymbolsKeyboard = false
+    private val TAG = "${BuildConfig.LOG_PREFIX} KeyboardIME"
 
     override fun onCreate() {
         super.onCreate()
@@ -69,7 +70,7 @@ class RemoteKeyboardIME : InputMethodService(), KeyboardView.OnKeyboardActionLis
                 }
             }
         }.start(wait = false)
-        Log.i("RemoteKeyboardIME", "Server started on 0.0.0.0:1993")
+        Log.i(TAG, "Server started on 0.0.0.0:1993")
 
         // Warm-up POST on IO thread
         warmupRemoteServer()
@@ -88,9 +89,9 @@ class RemoteKeyboardIME : InputMethodService(), KeyboardView.OnKeyboardActionLis
                 // read+close to complete the handshake
                 conn.inputStream.close()
                 conn.disconnect()
-                Log.i("RemoteKeyboardIME", "Warm-up done")
+                Log.i(TAG, "Warm-up done")
             } catch (e: Exception) {
-                Log.w("RemoteKeyboardIME", "Warm-up failed: ${e.message}")
+                Log.w(TAG, "Warm-up failed: ${e.message}")
             }
         }.start()
     }

@@ -16,7 +16,7 @@ class ClipboardReceiver : BroadcastReceiver() {
 
         when (intent.action) {
 
-            "com.shamanec.settings.CLIPBOARD_GET" -> {
+            "${BuildConfig.APPLICATION_ID}.CLIPBOARD_GET" -> {
                 val txt = cm.primaryClip
                     ?.takeIf { it.itemCount > 0 }
                     ?.getItemAt(0)
@@ -28,7 +28,7 @@ class ClipboardReceiver : BroadcastReceiver() {
                 resultData = b64
             }
 
-            "com.shamanec.settings.CLIPBOARD_SET" -> {
+            "${BuildConfig.APPLICATION_ID}.CLIPBOARD_SET" -> {
                 val b64 = intent.getStringExtra("text") ?: ""
                 val plain = String(Base64.decode(b64, Base64.NO_WRAP))
                 cm.setPrimaryClip(ClipData.newPlainText("remote", plain))

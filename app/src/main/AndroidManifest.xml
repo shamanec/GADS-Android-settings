@@ -95,8 +95,8 @@
 
         <receiver android:name=".ClipboardReceiver" android:exported="true">
             <intent-filter>
-                <action android:name="com.shamanec.settings.CLIPBOARD_GET"/>
-                <action android:name="com.shamanec.settings.CLIPBOARD_SET"/>
+                <action android:name="@string/clipboard_get_action"/>
+                <action android:name="@string/clipboard_set_action"/>
             </intent-filter>
         </receiver>
     </application>

@@ -356,7 +356,7 @@ class RemoteControlServer(private val port: Int) {
                         // 3. synchronous ordered broadcast: resultData holds Base64 text
                         Log.d(logTag, "Sending broadcast to GADS IME to get clipboard data")
                         val res = exec(
-                            "am broadcast -n $pkg/com.shamanec.settings.ClipboardReceiver -a com.shamanec.settings.CLIPBOARD_GET"
+                            "am broadcast -n $pkg/com.shamanec.settings.ClipboardReceiver -a ${BuildConfig.APPLICATION_ID}.CLIPBOARD_GET"
                         )
                         val b64 = Regex("""Broadcast completed: result=.*?data="(.*?)"""")
                             .find(res)?.groupValues?.get(1) ?: ""
@@ -476,7 +476,8 @@ class RemoteControlServer(private val port: Int) {
                 get("/installed-apps") {
                     try {
                         val installedApps = getInstalledApps()
-                        val filtered = installedApps.filterNot { it.packageName == BuildConfig.APPLICATION_ID }
+                        val ownPackages = setOf("com.gads.settings", "com.heliofleet.settings")
+                        val filtered = installedApps.filterNot { it.packageName in ownPackages }
                         call.respond(HttpStatusCode.OK, filtered)
                     } catch (e: Exception) {
                         Log.e(logTag, "Internal error getting installed apps: ${e.message}")
