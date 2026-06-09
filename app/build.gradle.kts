@@ -102,6 +102,5 @@ dependencies {
     // Kotlinx Serialization
     implementation ("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
 
-    implementation("io.getstream:stream-webrtc-android-ui:1.3.8")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
 }
