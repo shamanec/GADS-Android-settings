@@ -64,6 +64,19 @@ fun exec(
     return output
 }
 
+/**
+ * Returns "portrait" or "landscape" based on the actual display rotation -
+ * user_rotation only reflects the requested value, not what is on screen.
+ */
+fun getCurrentRotation(): String {
+    for (line in exec("dumpsys window").lineSequence()) {
+        if (line.contains("mRotation=") || line.contains("mCurrentRotation=")) {
+            return if (line.contains("ROTATION_90") || line.contains("ROTATION_270")) "landscape" else "portrait"
+        }
+    }
+    return "portrait"
+}
+
 @Serializable
 data class TapRequest(val x: Float, val y: Float)
 
@@ -93,6 +106,15 @@ data class ScreenSizeResponse(val x: Int, val y: Int)
 
 @Serializable
 data class ClipboardResponse(val value: String)
+
+@Serializable
+data class RotationRequest(val rotation: String)
+
+@Serializable
+data class RotationResponse(val rotation: String)
+
+@Serializable
+data class SetRotationResponse(val rotation: String, val applied: Boolean)
 
 @Serializable
 data class AppInfo(
@@ -339,6 +361,48 @@ class RemoteControlServer(private val port: Int) {
                     } catch (e: Exception) {
                         Log.e(logTag, "Internal error getting device screen dimensions: ${e.message}")
                         call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed getting device screen dimensions - ${e.message}"))
+                    }
+                }
+
+                get("/rotation") {
+                    Log.d(logTag, "Getting device rotation")
+                    try {
+                        call.respond(HttpStatusCode.OK, RotationResponse(getCurrentRotation()))
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Internal error getting device rotation: ${e.message}")
+                        call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed getting device rotation - ${e.message}"))
+                    }
+                }
+
+                post("/rotation") {
+                    try {
+                        val request = call.receive<RotationRequest>()
+                        if (request.rotation != "portrait" && request.rotation != "landscape") {
+                            call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid rotation `${request.rotation}`, expected `portrait` or `landscape`"))
+                            return@post
+                        }
+                        try {
+                            Log.d(logTag, "Attempting to change device rotation to `${request.rotation}`")
+                            // user_rotation only takes effect when auto-rotate is off
+                            exec("settings put system accelerometer_rotation 0")
+                            exec("settings put system user_rotation ${if (request.rotation == "landscape") "1" else "0"}")
+                            // Rotation is not instant, wait before reading it back
+                            delay(1000)
+                            val currentRotation = getCurrentRotation()
+                            val applied = currentRotation == request.rotation
+                            if (!applied) {
+                                // Revert the pending user_rotation when the screen did not rotate,
+                                // otherwise it would kick in once the foreground app changes
+                                exec("settings put system user_rotation ${if (currentRotation == "landscape") "1" else "0"}")
+                            }
+                            call.respond(HttpStatusCode.OK, SetRotationResponse(currentRotation, applied))
+                        } catch (e: Exception) {
+                            Log.e(logTag, "Internal error changing device rotation: ${e.message}")
+                            call.respond(HttpStatusCode.InternalServerError, StatusResponse("error", "Failed changing device rotation - ${e.message}"))
+                        }
+                    } catch (e: Exception) {
+                        Log.e(logTag, "Bad request changing device rotation: ${e.message}")
+                        call.respond(HttpStatusCode.BadRequest, StatusResponse("error", "Invalid rotation request - ${e.message}"))
                     }
                 }
 
