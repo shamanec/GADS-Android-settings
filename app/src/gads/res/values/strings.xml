@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">GADS Settings</string>
+    <string name="ime_label">GADS Remote Keyboard</string>
+    <string name="app_description">GADS Settings application contains the code needed to support remote keyboard typing and screen streaming services.\nIt does nothing by itself when launched!</string>
+    <string name="clipboard_get_action" translatable="false">com.gads.settings.CLIPBOARD_GET</string>
+    <string name="clipboard_set_action" translatable="false">com.gads.settings.CLIPBOARD_SET</string>
+</resources>

@@ -25,16 +25,16 @@
 -dontwarn org.slf4j.impl.StaticLoggerBinder
 
 # Keep RemoteControlServer for app_process execution
--keep class com.gads.settings.RemoteControlServerKt { *; }
--keep class com.gads.settings.RemoteControlServer { *; }
--keep class com.gads.settings.InputInjector { *; }
+-keep class com.shamanec.settings.RemoteControlServerKt { *; }
+-keep class com.shamanec.settings.RemoteControlServer { *; }
+-keep class com.shamanec.settings.InputInjector { *; }
 
 # Keep H264Server for app_process execution
--keep class com.gads.settings.server.H264Server {
+-keep class com.shamanec.settings.server.H264Server {
     public static void main(java.lang.String[]);
 }
--keep class com.gads.settings.server.H264Server { *; }
--keep class com.gads.settings.server.** { *; }
+-keep class com.shamanec.settings.server.H264Server { *; }
+-keep class com.shamanec.settings.server.** { *; }
 
 # Keep reflection targets (hidden Android APIs)
 -keep class android.os.ServiceManager { *; }
