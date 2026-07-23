@@ -64,27 +64,17 @@ fun exec(
     return output
 }
 
-/**
- * Returns "portrait" or "landscape" based on the display surface orientation
- * (0/1/2/3). Reading the focused window config is unreliable: a letterboxed app
- * (e.g. YouTube) keeps a portrait window even when the display is forced to landscape.
- */
+// Display viewport orientation (0/1/2/3), not the focused window (a letterboxed app stays portrait).
 fun getCurrentRotation(): String {
-    for (line in exec("dumpsys input").lineSequence()) {
-        val idx = line.indexOf("SurfaceOrientation:")
-        if (idx < 0) continue
-        val value = line.substring(idx + "SurfaceOrientation:".length).trim().takeWhile { it.isDigit() }.toIntOrNull()
-        return if (value == 1 || value == 3) "landscape" else "portrait"
-    }
-    return "portrait"
+    val match = Regex("DisplayViewport\\{type=INTERNAL[^}]*orientation=(\\d)").find(exec("dumpsys display"))
+    val value = match?.groupValues?.get(1)?.toIntOrNull()
+    return if (value == 1 || value == 3) "landscape" else "portrait"
 }
 
-// Packages that must keep their natural orientation. The display-wide force override is
-// never applied while one of these is focused, so the launcher and GADS stay in portrait.
+// Launcher and GADS keep their natural orientation - the force override is never applied to them.
 private val gadsPackagePrefixes = listOf("com.gads.", "com.shamanec.")
 private var cachedLauncherPackage: String? = null
 
-// Last rotation requested by the user; the watcher keeps the force override in sync with it.
 @Volatile
 private var desiredRotation = "portrait"
 
@@ -98,26 +88,25 @@ private fun launcherPackage(): String {
 }
 
 private fun foregroundPackage(): String {
-    // mResumedActivity reflects the real foreground; mFocusedApp in `dumpsys window`
-    // goes stale (keeps pointing at a force-stopped app even after returning home).
+    // Matches (m|top)ResumedActivity across versions; dumpsys window's mFocusedApp goes stale.
     for (line in exec("dumpsys activity activities").lineSequence()) {
-        if (!line.contains("mResumedActivity")) continue
+        if (!line.contains("ResumedActivity")) continue
         val match = Regex("([a-zA-Z0-9._]+)/").find(line) ?: continue
         return match.groupValues[1]
     }
     return ""
 }
 
-// A "real app" is anything that is not the launcher or a GADS package - only those get the
-// forced orientation override. An empty package (transient focus) counts as non-app.
+// Only real apps (not the launcher/GADS, not empty transient focus) get the forced override.
 private fun isRealApp(pkg: String): Boolean =
     pkg.isNotEmpty() && pkg != launcherPackage() && gadsPackagePrefixes.none { pkg.startsWith(it) }
 
-// Enables/disables the display-wide "ignore per-app orientation" override (command renamed across releases).
+// Force display to user rotation (command renamed in API 31; set-ignore variant breaks on Samsung).
 private fun setForceRotation(enable: Boolean) {
+    val arg = if (enable) "enabled" else "disabled"
     when {
-        Build.VERSION.SDK_INT >= 31 -> exec("cmd window set-ignore-orientation-request ${if (enable) "true" else "false"}")
-        Build.VERSION.SDK_INT >= 29 -> exec("cmd window set-fix-to-user-rotation ${if (enable) "enabled" else "disabled"}")
+        Build.VERSION.SDK_INT >= 31 -> exec("cmd window fixed-to-user-rotation $arg")
+        Build.VERSION.SDK_INT >= 29 -> exec("cmd window set-fix-to-user-rotation $arg")
     }
 }
 
@@ -430,11 +419,8 @@ class RemoteControlServer(private val port: Int) {
                         }
                         try {
                             Log.d(logTag, "Attempting to change device rotation to `${request.rotation}`")
-                            val foreground = foregroundPackage()
-                            if (!isRealApp(foreground)) {
-                                // The launcher and GADS keep their natural orientation - drop the override
-                                // so the home screen stays portrait instead of being forced to rotate.
-                                Log.d(logTag, "Ignoring rotation request on non-app foreground `$foreground`")
+                            if (!isRealApp(foregroundPackage())) {
+                                // Never force the launcher/GADS - keep their natural orientation
                                 setForceRotation(false)
                                 call.respond(HttpStatusCode.OK, SetRotationResponse(getCurrentRotation(), false))
                                 return@post
@@ -455,8 +441,7 @@ class RemoteControlServer(private val port: Int) {
                             }
                             val applied = currentRotation == request.rotation
                             if (!applied) {
-                                // Pre-29 devices cannot force rotation; revert the pending user_rotation
-                                // so it does not kick in once the foreground app changes
+                                // Pre-29 has no force override; revert the pending user_rotation
                                 exec("settings put system user_rotation ${if (currentRotation == "landscape") "1" else "0"}")
                             }
                             call.respond(HttpStatusCode.OK, SetRotationResponse(currentRotation, applied))
@@ -635,9 +620,7 @@ class RemoteControlServer(private val port: Int) {
         return width to height
     }
 
-    // Keeps the display-wide force override in sync with the foreground app: enabled only while a
-    // real app is focused and landscape is desired, disabled otherwise so the launcher/GADS revert
-    // to their natural portrait orientation when they come to the foreground.
+    // Keeps the force in sync with the foreground: on for a real app in landscape, off elsewhere.
     private fun startOrientationWatcher() {
         watcherScope.launch {
             var lastForce: Boolean? = null
@@ -646,8 +629,7 @@ class RemoteControlServer(private val port: Int) {
                     val force = desiredRotation == "landscape" && isRealApp(foregroundPackage())
                     if (force != lastForce) {
                         if (force) {
-                            // A real app regained focus while landscape is desired - re-assert it,
-                            // since the launcher resets user_rotation back to portrait on the way out.
+                            // Re-assert landscape; the launcher resets user_rotation on the way out
                             exec("settings put system accelerometer_rotation 0")
                             exec("settings put system user_rotation 1")
                         }
