@@ -64,17 +64,50 @@ fun exec(
     return output
 }
 
-/**
- * Returns "portrait" or "landscape" based on the actual display rotation -
- * user_rotation only reflects the requested value, not what is on screen.
- */
+// Display viewport orientation (0/1/2/3), not the focused window (a letterboxed app stays portrait).
 fun getCurrentRotation(): String {
-    for (line in exec("dumpsys window").lineSequence()) {
-        if (line.contains("mRotation=") || line.contains("mCurrentRotation=")) {
-            return if (line.contains("ROTATION_90") || line.contains("ROTATION_270")) "landscape" else "portrait"
-        }
+    val match = Regex("DisplayViewport\\{type=INTERNAL[^}]*orientation=(\\d)").find(exec("dumpsys display"))
+    val value = match?.groupValues?.get(1)?.toIntOrNull()
+    return if (value == 1 || value == 3) "landscape" else "portrait"
+}
+
+// Launcher and GADS keep their natural orientation - the force override is never applied to them.
+private val gadsPackagePrefixes = listOf("com.gads.", "com.shamanec.")
+private var cachedLauncherPackage: String? = null
+
+@Volatile
+private var desiredRotation = "portrait"
+
+private fun launcherPackage(): String {
+    cachedLauncherPackage?.let { return it }
+    val pkg = exec("cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN")
+        .lineSequence().map { it.trim() }.lastOrNull { it.contains("/") }
+        ?.substringBefore("/").orEmpty()
+    cachedLauncherPackage = pkg
+    return pkg
+}
+
+private fun foregroundPackage(): String {
+    // Matches (m|top)ResumedActivity across versions; dumpsys window's mFocusedApp goes stale.
+    for (line in exec("dumpsys activity activities").lineSequence()) {
+        if (!line.contains("ResumedActivity")) continue
+        val match = Regex("([a-zA-Z0-9._]+)/").find(line) ?: continue
+        return match.groupValues[1]
     }
-    return "portrait"
+    return ""
+}
+
+// Only real apps (not the launcher/GADS, not empty transient focus) get the forced override.
+private fun isRealApp(pkg: String): Boolean =
+    pkg.isNotEmpty() && pkg != launcherPackage() && gadsPackagePrefixes.none { pkg.startsWith(it) }
+
+// Force display to user rotation (command renamed in API 31; set-ignore variant breaks on Samsung).
+private fun setForceRotation(enable: Boolean) {
+    val arg = if (enable) "enabled" else "disabled"
+    when {
+        Build.VERSION.SDK_INT >= 31 -> exec("cmd window fixed-to-user-rotation $arg")
+        Build.VERSION.SDK_INT >= 29 -> exec("cmd window set-fix-to-user-rotation $arg")
+    }
 }
 
 @Serializable
@@ -144,6 +177,7 @@ class RemoteControlServer(private val port: Int) {
     private var screenWidth: Int = 0
     private var screenHeight: Int = 0
     private var logTag = "${BuildConfig.LOG_PREFIX} Remote"
+    private val watcherScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     
     // Cached reflection objects for SurfaceControl screenshot
     private val screenshotMethod: Method?
@@ -242,6 +276,8 @@ class RemoteControlServer(private val port: Int) {
         val screenDimensions = getScreenSize()
         screenWidth = screenDimensions.first
         screenHeight = screenDimensions.second
+
+        startOrientationWatcher()
 
         val jsonFormatter = Json {
             prettyPrint = false
@@ -383,16 +419,29 @@ class RemoteControlServer(private val port: Int) {
                         }
                         try {
                             Log.d(logTag, "Attempting to change device rotation to `${request.rotation}`")
+                            if (!isRealApp(foregroundPackage())) {
+                                // Never force the launcher/GADS - keep their natural orientation
+                                setForceRotation(false)
+                                call.respond(HttpStatusCode.OK, SetRotationResponse(getCurrentRotation(), false))
+                                return@post
+                            }
+                            desiredRotation = request.rotation
                             // user_rotation only takes effect when auto-rotate is off
                             exec("settings put system accelerometer_rotation 0")
                             exec("settings put system user_rotation ${if (request.rotation == "landscape") "1" else "0"}")
-                            // Rotation is not instant, wait before reading it back
-                            delay(1000)
-                            val currentRotation = getCurrentRotation()
+                            // Force the display to honour it even if the focused app pins its orientation
+                            setForceRotation(request.rotation == "landscape")
+                            // Rotation is not instant; poll until the display reflects it (~2s max)
+                            var currentRotation = getCurrentRotation()
+                            var attempts = 0
+                            while (currentRotation != request.rotation && attempts < 10) {
+                                delay(200)
+                                currentRotation = getCurrentRotation()
+                                attempts++
+                            }
                             val applied = currentRotation == request.rotation
                             if (!applied) {
-                                // Revert the pending user_rotation when the screen did not rotate,
-                                // otherwise it would kick in once the foreground app changes
+                                // Pre-29 has no force override; revert the pending user_rotation
                                 exec("settings put system user_rotation ${if (currentRotation == "landscape") "1" else "0"}")
                             }
                             call.respond(HttpStatusCode.OK, SetRotationResponse(currentRotation, applied))
@@ -569,6 +618,30 @@ class RemoteControlServer(private val port: Int) {
         val height = dm.heightPixels
         Log.i(logTag, "Got screen size via DisplayManagerGlobal: $width:$height")
         return width to height
+    }
+
+    // Keeps the force in sync with the foreground: on for a real app in landscape, off elsewhere.
+    private fun startOrientationWatcher() {
+        watcherScope.launch {
+            var lastForce: Boolean? = null
+            while (true) {
+                try {
+                    val force = desiredRotation == "landscape" && isRealApp(foregroundPackage())
+                    if (force != lastForce) {
+                        if (force) {
+                            // Re-assert landscape; the launcher resets user_rotation on the way out
+                            exec("settings put system accelerometer_rotation 0")
+                            exec("settings put system user_rotation 1")
+                        }
+                        setForceRotation(force)
+                        lastForce = force
+                    }
+                } catch (e: Exception) {
+                    Log.w(logTag, "Orientation watcher error: ${e.message}")
+                }
+                delay(700)
+            }
+        }
     }
 
     private fun takeScreenshot(useJpeg: Boolean = true, scale: Int = 2): String? {
