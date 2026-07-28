@@ -4,10 +4,12 @@
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.INJECT_EVENTS"
         tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:allowBackup="true"
@@ -75,6 +77,22 @@
             android:foregroundServiceType="mediaProjection"
             android:exported="true">
         </service>
+
+        <service
+            android:name=".audio.AudioService"
+            android:foregroundServiceType="mediaProjection|microphone"
+            android:exported="true">
+        </service>
+
+        <activity
+            android:name=".audio.AudioProjectionActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+            </intent-filter>
+        </activity>
 
         <receiver android:name=".ClipboardReceiver" android:exported="true">
             <intent-filter>
